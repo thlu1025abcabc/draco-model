@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local data
+/data/
+
+# IDE
+.idea/
+.vscode/
+
+# Local assistant/editor settings
+.claude/settings.local.json
+
+# OS
+.DS_Store
+Thumbs.db
