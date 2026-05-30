@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import polars as pl
 
 from draco_model.core import Layer, Node
@@ -8,12 +10,31 @@ from draco_model.layers.names import validate_public_alias
 from draco_model.layers.operators import ARITHMETIC_OPS
 from draco_model.market.minute_calendar import AUCTION_MINUTES
 from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
-from draco_model.runtime.execution import EvalContext, FieldInfo, FrameSchema, register_executor, register_schema
+from draco_model.runtime.execution import EvalContext, FieldInfo, FramePlan, FrameSchema, register_executor, register_plan
 
 
 APPLY_TO_COMPONENTS = "components"
 APPLY_TO_FIELD = "field"
 DAILY_FREQUENCIES = {"1d", "daily"}
+
+
+@dataclass(frozen=True)
+class AggregateValueSpec:
+    """One public field aggregation described by the aggregate layout plan."""
+
+    source: str
+    output: str
+    info: FieldInfo
+    component_sources: tuple[str, ...] = ()
+    component_outputs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AggregatePlan(FramePlan):
+    """Output layout and expression specs for an aggregate node."""
+
+    value_specs: tuple[AggregateValueSpec, ...] = ()
+    payloads: tuple[str, ...] = ()
 
 
 class Aggregate(Layer):
@@ -112,8 +133,8 @@ def _aggregate(node: Node, context: EvalContext) -> pl.LazyFrame:
     return grouped.sort(list(KEY_COLUMNS))
 
 
-@register_schema("aggregate")
-def _aggregate_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
+@register_plan("aggregate")
+def _aggregate_plan(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FramePlan:
     parent = parent_schemas["input"]
     frequency = str(node.params["frequency"]).strip().lower()
     apply_to = str(node.params.get("apply_to", APPLY_TO_FIELD))
@@ -126,8 +147,7 @@ def _aggregate_schema(node: Node, parent_schemas: dict[str, FrameSchema], contex
         parse_minute_frequency(frequency)
         keys = KEY_COLUMNS
         grain = "minute"
-    columns, fields = _aggregate_schema_parts(parent, keys, grain, apply_to, value_col, alias)
-    return FrameSchema(columns=columns, keys=keys, grain=grain, fields=fields)
+    return _aggregate_plan_from_schema(parent, keys, grain, apply_to, value_col, alias)
 
 
 def aggregate_value_columns(schema: FrameSchema, value_col: object | None = None) -> list[str]:
@@ -166,59 +186,28 @@ def _aggregate_values(
     alias: object | None,
     *,
     order_col: str | None,
-) -> tuple[pl.LazyFrame, dict[str, FieldInfo]]:
-    value_columns = aggregate_value_columns(schema, value_col)
-    if alias is not None and len(value_columns) != 1:
-        raise ValueError("Aggregate alias requires exactly one value column.")
+) -> tuple[pl.LazyFrame, AggregatePlan]:
+    grain = "daily" if group_keys == DAILY_KEY_COLUMNS else "minute"
+    plan = _aggregate_plan_from_schema(schema, group_keys, grain, apply_to, value_col, alias)
     exprs: list[pl.Expr] = []
-    output_columns: list[str] = []
     recompute: list[pl.Expr] = []
-    consumed_payloads: set[str] = set()
-    fields: dict[str, FieldInfo] = {}
-    for index, column in enumerate(value_columns):
-        info = _field_for_column(schema, column)
-        output = str(alias) if alias is not None else column
-        output_column = output
-        if apply_to == APPLY_TO_COMPONENTS and info.component_agg and info.components:
-            aggregated_components = tuple(f"__op_{output}_{idx}" for idx, _ in enumerate(info.components))
-            for component, out_component in zip(info.components, aggregated_components):
+
+    for spec in plan.value_specs:
+        if spec.component_sources:
+            for component, out_component in zip(spec.component_sources, spec.component_outputs):
                 exprs.append(_agg_expr(component, agg, order_col).alias(out_component))
-                consumed_payloads.add(component)
-            recompute.append(_operator_expr(info.operator, aggregated_components).alias(output_column))
-            output_columns.append(output_column)
-            output_columns.extend(aggregated_components)
-            fields[output] = FieldInfo(
-                name=output,
-                column=output_column,
-                operator=info.operator,
-                components=aggregated_components,
-                source=info.source,
-                lookback_days=info.lookback_days,
-                component_agg=info.operator in ARITHMETIC_OPS,
-            )
+            recompute.append(_operator_expr(spec.info.operator, spec.component_outputs).alias(spec.output))
         else:
-            exprs.append(_agg_expr(column, agg, order_col).alias(output_column))
-            output_columns.append(output_column)
-            fields[output] = FieldInfo(
-                name=output,
-                column=output_column,
-                operator="identity",
-                source=info.source,
-                lookback_days=info.lookback_days,
-                component_agg=False,
-            )
-    for payload in _payload_columns(schema):
-        if payload in consumed_payloads or payload in output_columns:
-            continue
+            exprs.append(_agg_expr(spec.source, agg, order_col).alias(spec.output))
+    for payload in plan.payloads:
         exprs.append(_agg_expr(payload, agg, order_col).alias(payload))
-        output_columns.append(payload)
     grouped = frame.group_by(list(group_keys)).agg(exprs)
     if recompute:
         grouped = grouped.with_columns(recompute)
-    return grouped.select([*group_keys, *output_columns]), fields
+    return grouped.select(list(plan.columns)), plan
 
 
-def _aggregate_schema_parts(
+def _aggregate_plan_from_schema(
     parent: FrameSchema,
     keys: tuple[str, ...],
     grain: str,
@@ -231,6 +220,8 @@ def _aggregate_schema_parts(
         raise ValueError("Aggregate alias requires exactly one value column.")
     columns: list[str] = list(keys)
     fields: dict[str, FieldInfo] = {}
+    specs: list[AggregateValueSpec] = []
+    consumed_payloads: set[str] = set()
     for column in values:
         info = _field_for_column(parent, column)
         output = str(alias) if alias is not None else column
@@ -243,6 +234,7 @@ def _aggregate_schema_parts(
             columns.extend(components)
             operator = info.operator
             component_agg = True
+            consumed_payloads.update(info.components)
         fields[output] = FieldInfo(
             name=output,
             column=output,
@@ -252,14 +244,30 @@ def _aggregate_schema_parts(
             lookback_days=info.lookback_days,
             component_agg=component_agg,
         )
-    consumed_payloads = {
-        component
-        for column in values
-        for component in _field_for_column(parent, column).components
-        if apply_to == APPLY_TO_COMPONENTS and _field_for_column(parent, column).component_agg
-    }
-    columns.extend(payload for payload in _payload_columns(parent) if payload not in consumed_payloads)
-    return tuple(columns), fields
+        specs.append(
+            AggregateValueSpec(
+                source=column,
+                output=output,
+                info=info,
+                component_sources=info.components if components else (),
+                component_outputs=components,
+            )
+        )
+    output_columns = set(columns) - set(keys)
+    payloads = tuple(
+        payload
+        for payload in _payload_columns(parent)
+        if payload not in consumed_payloads and payload not in output_columns
+    )
+    columns.extend(payloads)
+    return AggregatePlan(
+        columns=tuple(columns),
+        keys=keys,
+        grain=grain,
+        fields=fields,
+        value_specs=tuple(specs),
+        payloads=payloads,
+    )
 
 
 def _apply_auction(frame: pl.LazyFrame, auction: str, context: EvalContext, interval: int) -> pl.LazyFrame:
@@ -298,7 +306,7 @@ def _merge_auction_frame(
     value_col: object | None,
     alias: object | None,
 ) -> tuple[pl.LazyFrame, FrameSchema]:
-    merged, fields = _aggregate_values(
+    merged, plan = _aggregate_values(
         frame,
         schema,
         KEY_COLUMNS,
@@ -309,10 +317,10 @@ def _merge_auction_frame(
         order_col="__order_minute",
     )
     return merged, FrameSchema(
-        columns=tuple(merged.collect_schema().names()),
+        columns=plan.columns,
         keys=KEY_COLUMNS,
         grain="minute",
-        fields=fields,
+        fields=plan.fields,
     )
 
 

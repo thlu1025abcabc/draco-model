@@ -14,9 +14,11 @@ from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
 
 
 Executor = Callable[[Node, "EvalContext"], pl.LazyFrame]
+PlanBuilder = Callable[[Node, dict[str, "FrameSchema"], "EvalContext"], "FramePlan"]
 SchemaInferer = Callable[[Node, dict[str, "FrameSchema"], "EvalContext"], "FrameSchema"]
 
 _EXECUTORS: dict[str, Executor] = {}
+_PLAN_BUILDERS: dict[str, PlanBuilder] = {}
 _SCHEMA_INFERERS: dict[str, SchemaInferer] = {}
 
 
@@ -51,6 +53,35 @@ class FieldInfo:
 
 
 @dataclass(frozen=True)
+class FramePlan:
+    """Single source of truth for a frame node's output layout."""
+
+    columns: tuple[str, ...]
+    keys: tuple[str, ...] = ()
+    grain: str = "unknown"
+    fields: dict[str, FieldInfo] = field(default_factory=dict)
+
+    @classmethod
+    def from_schema(cls, schema: FrameSchema) -> "FramePlan":
+        """Create a plan that preserves an existing schema layout."""
+        return cls(
+            columns=schema.columns,
+            keys=schema.keys,
+            grain=schema.grain,
+            fields=schema.fields,
+        )
+
+    def schema(self) -> FrameSchema:
+        """Return this plan's public schema contract."""
+        return FrameSchema(
+            columns=self.columns,
+            keys=self.keys,
+            grain=self.grain,
+            fields=self.fields,
+        )
+
+
+@dataclass(frozen=True)
 class TraceStep:
     """Materialized output for one traced frame node."""
 
@@ -66,6 +97,16 @@ def register_executor(op: str) -> Callable[[Executor], Executor]:
     def decorator(executor: Executor) -> Executor:
         _EXECUTORS[op] = executor
         return executor
+
+    return decorator
+
+
+def register_plan(op: str) -> Callable[[PlanBuilder], PlanBuilder]:
+    """Register the output layout planner for nodes with a given op name."""
+
+    def decorator(builder: PlanBuilder) -> PlanBuilder:
+        _PLAN_BUILDERS[op] = builder
+        return builder
 
     return decorator
 
@@ -86,6 +127,11 @@ def get_executor(op: str) -> Executor:
         return _EXECUTORS[op]
     except KeyError:
         raise ValueError(f"Unsupported node op {op!r}.") from None
+
+
+def get_plan_builder(op: str) -> PlanBuilder | None:
+    """Return the registered frame plan builder for an op, if one exists."""
+    return _PLAN_BUILDERS.get(op)
 
 
 def get_schema_inferer(op: str) -> SchemaInferer | None:

@@ -4,34 +4,33 @@ import polars as pl
 
 from draco_model.core import Node
 from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
-from draco_model.runtime.execution import EvalContext, FrameSchema, register_executor, register_schema
+from draco_model.runtime.execution import EvalContext, FramePlan, FrameSchema, register_executor, register_plan
 
 
-class Source:
-    """Factory for raw source frame nodes."""
-
-    def __new__(cls, source: str, *, lookback_days: int = 1, name: str | None = None) -> Node:
-        if lookback_days < 1:
-            raise ValueError("lookback_days must be >= 1.")
-        return Node(
-            kind="frame",
-            op="source",
-            params={"source": source, "lookback_days": lookback_days},
-            name=name,
-        )
+def Source(source: str, *, lookback_days: int = 1, name: str | None = None) -> Node:
+    """Create a raw source frame node."""
+    if lookback_days < 1:
+        raise ValueError("lookback_days must be >= 1.")
+    return Node(
+        kind="frame",
+        op="source",
+        params={"source": source, "lookback_days": lookback_days},
+        name=name,
+    )
 
 
 @register_executor("source")
 def _source(node: Node, context: EvalContext) -> pl.LazyFrame:
     dates = context.trading_calendar.previous_sessions(context.eval_date, int(node.params.get("lookback_days", 1)))
-    return context.sources.scan(str(node.params["source"]), dates)
+    source = str(node.params["source"])
+    columns = context.sources.schema(source, dates)
+    return context.sources.scan(source, dates).select(list(columns))
 
 
-@register_schema("source")
-def _source_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
+@register_plan("source")
+def _source_plan(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FramePlan:
     dates = context.trading_calendar.previous_sessions(context.eval_date, int(node.params.get("lookback_days", 1)))
-    frame = context.sources.scan(str(node.params["source"]), dates)
-    columns = tuple(frame.collect_schema().names())
+    columns = context.sources.schema(str(node.params["source"]), dates)
     if all(column in columns for column in KEY_COLUMNS):
         keys = KEY_COLUMNS
         grain = "raw"
@@ -41,4 +40,4 @@ def _source_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: 
     else:
         keys = ()
         grain = "raw"
-    return FrameSchema(columns=columns, keys=keys, grain=grain)
+    return FramePlan(columns=columns, keys=keys, grain=grain)

@@ -6,7 +6,7 @@ import polars as pl
 
 from draco_model.core import Layer, Node
 from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
-from draco_model.runtime.execution import EvalContext, FieldInfo, FrameSchema, register_executor, register_schema
+from draco_model.runtime.execution import EvalContext, FieldInfo, FramePlan, FrameSchema, register_executor, register_plan
 
 
 class FillNull(Layer):
@@ -31,17 +31,19 @@ class FillNull(Layer):
 def _fill_null(node: Node, context: EvalContext) -> pl.LazyFrame:
     parent = node.inputs["input"]
     schema = context.infer_schema(parent)
+    plan = _fill_null_plan_from_schema(schema)
     value = node.params.get("value", "state")
     value_col = _single_value_column(schema)
     info = _field_for_column(schema, value_col)
 
     if _is_numeric_fill(value):
-        return context.evaluate(parent).with_columns(pl.col(value_col).fill_null(value).alias(value_col))
+        return context.evaluate(parent).with_columns(pl.col(value_col).fill_null(value).alias(value_col)).select(list(plan.columns))
     if value == "ffill":
         return (
             context.evaluate(parent)
             .sort(list(schema.keys))
             .with_columns(pl.col(value_col).forward_fill().over(list(DAILY_KEY_COLUMNS)).alias(value_col))
+            .select(list(plan.columns))
         )
     if value != "state":
         raise ValueError("FillNull supports numeric literals, 'ffill', or 'state'.")
@@ -54,15 +56,19 @@ def _fill_null(node: Node, context: EvalContext) -> pl.LazyFrame:
         .join(close_state.select([*KEY_COLUMNS, "__close_state"]), on=list(KEY_COLUMNS), how="left")
         .with_columns(pl.col(value_col).fill_null(pl.col("__close_state")).alias(value_col))
         .drop("__close_state")
+        .select(list(plan.columns))
     )
 
 
-@register_schema("fill_null")
-def _fill_null_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
-    parent = parent_schemas["input"]
+@register_plan("fill_null")
+def _fill_null_plan(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FramePlan:
+    return _fill_null_plan_from_schema(parent_schemas["input"])
+
+
+def _fill_null_plan_from_schema(parent: FrameSchema) -> FramePlan:
     value_col = _single_value_column(parent)
     info = _field_for_column(parent, value_col)
-    return FrameSchema(
+    return FramePlan(
         columns=parent.columns,
         keys=parent.keys,
         grain=parent.grain,

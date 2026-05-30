@@ -23,6 +23,14 @@ class SourceCatalog:
             raise ValueError("Source scan requires at least one date.")
         return pl.concat(frames, how="diagonal_relaxed")
 
+    def schema(self, source: str, dates: list[str]) -> tuple[str, ...]:
+        """Return normalized source columns, using fixed source contracts when known."""
+        if not dates:
+            raise ValueError("Source schema requires at least one date.")
+        if source in _FIXED_SOURCE_SCHEMAS:
+            return _FIXED_SOURCE_SCHEMAS[source]
+        return tuple(self.scan(source, dates).collect_schema().names())
+
     def _scan_date(self, source: str, date: str) -> pl.LazyFrame:
         key = (source, date)
         if key in self._scans:
@@ -101,3 +109,80 @@ def _standardize_columns(frame: pl.LazyFrame, date: str) -> pl.LazyFrame:
     if casts:
         frame = frame.with_columns(casts)
     return frame
+
+
+_TRADE_CANCEL_TBAR_SCHEMA = (
+    "secu_code",
+    "minute",
+    "price",
+    "side",
+    "volume",
+    "vw_wait_time",
+    "is_first",
+    "is_last",
+    "no",
+    "date",
+)
+
+_QUOTE_TBAR_SCHEMA = (
+    "secu_code",
+    "minute",
+    "price",
+    "side",
+    "volume",
+    "is_first",
+    "is_last",
+    "no",
+    "date",
+)
+
+_DAILY_K_SCHEMA = (
+    "sec_code",
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "shares",
+    "amount",
+    "limit_up",
+    "limit_down",
+    "preclose",
+    "isSuspend",
+    "isST",
+    "adjfactor",
+    "total_share",
+    "float_share",
+    "free_share",
+    "list_date",
+    "secu_code",
+)
+
+_SNAPSHOT_TBAR_SCHEMA = (
+    *(f"AskPrice{level}" for level in range(1, 11)),
+    *(f"BidPrice{level}" for level in range(1, 11)),
+    *(f"AskVolume{level}" for level in range(1, 11)),
+    *(f"BidVolume{level}" for level in range(1, 11)),
+    *(f"aVOI{level}" for level in range(1, 6)),
+    "secu_code",
+    "minute",
+    "date",
+)
+
+_UNIVERSE_EX2KAMT_SCHEMA = (
+    "sec_code",
+    "preclose",
+    "close",
+    "adjfactor",
+    "secu_code",
+    "date",
+)
+
+_FIXED_SOURCE_SCHEMAS = {
+    "trades_tbar": _TRADE_CANCEL_TBAR_SCHEMA,
+    "cancels_tbar": _TRADE_CANCEL_TBAR_SCHEMA,
+    "quotes_tbar": _QUOTE_TBAR_SCHEMA,
+    "daily_k": _DAILY_K_SCHEMA,
+    "snapshot_tbar": _SNAPSHOT_TBAR_SCHEMA,
+    "universe/ex2kamt": _UNIVERSE_EX2KAMT_SCHEMA,
+}

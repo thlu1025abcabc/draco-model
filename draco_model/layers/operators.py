@@ -8,7 +8,7 @@ import polars as pl
 from draco_model.core import Node
 from draco_model.layers.names import validate_public_alias
 from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
-from draco_model.runtime.execution import EvalContext, FieldInfo, FrameSchema, register_executor, register_schema
+from draco_model.runtime.execution import EvalContext, FieldInfo, FramePlan, FrameSchema, register_executor, register_plan
 
 
 ARITHMETIC_OPS = {"add", "sub", "mul", "div"}
@@ -111,6 +111,8 @@ def Op(name: str, *operands: Any, alias: str | None = None, **params: Any) -> No
     """Create a generic operator node or row-level expression."""
     if name not in ARITHMETIC_OPS | WINDOW_OPS:
         raise ValueError(f"Unsupported operator {name!r}.")
+    if name in WINDOW_OPS:
+        _validate_window_params(name, params)
     normalized = [_normalize_operand(operand) for operand in operands]
     if any(isinstance(operand, Node) for operand in normalized):
         if any(isinstance(operand, (Col, OpExpr)) for operand in normalized):
@@ -131,21 +133,26 @@ def alias_node(node: Node, alias: str) -> Node:
 
 @register_executor("column")
 def _column(node: Node, context: EvalContext) -> pl.LazyFrame:
+    parent_schema = context.infer_schema(node.inputs["input"])
+    plan = _column_plan_from_schema(node, parent_schema)
     frame = context.evaluate(node.inputs["input"])
     column = str(node.params["column"])
     alias = str(node.params["alias"])
-    _require_columns(list(context.infer_schema(node.inputs["input"]).columns), [column])
-    return frame.with_columns(pl.col(column).alias(alias))
+    _require_columns(list(parent_schema.columns), [column])
+    return frame.with_columns(pl.col(column).alias(alias)).select(list(plan.columns))
 
 
-@register_schema("column")
-def _column_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
-    parent = parent_schemas["input"]
+@register_plan("column")
+def _column_plan(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FramePlan:
+    return _column_plan_from_schema(node, parent_schemas["input"])
+
+
+def _column_plan_from_schema(node: Node, parent: FrameSchema) -> FramePlan:
     column = str(node.params["column"])
     alias = str(node.params["alias"])
     _require_columns(list(parent.columns), [column])
     columns = _append_column(parent.columns, alias)
-    return FrameSchema(
+    return FramePlan(
         columns=columns,
         keys=parent.keys,
         grain=parent.grain,
@@ -168,13 +175,13 @@ def _op(node: Node, context: EvalContext) -> pl.LazyFrame:
     return _frame_op_executor(node, context)
 
 
-@register_schema("op")
-def _op_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
+@register_plan("op")
+def _op_plan(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FramePlan:
     mode = str(node.params.get("mode", "frame"))
     if mode == "row":
         parent = parent_schemas["input"]
         alias = str(node.params["alias"])
-        return FrameSchema(
+        return FramePlan(
             columns=_append_column(parent.columns, alias),
             keys=parent.keys,
             grain=parent.grain,
@@ -208,7 +215,7 @@ def _op_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: Eval
         for renamed in _payload_renames(input_name, schema).values()
     )
     columns = (*keys, alias, *components, *payloads)
-    return FrameSchema(
+    return FramePlan(
         columns=columns,
         keys=keys,
         grain=_common_grain(input_schemas),
@@ -230,20 +237,24 @@ def _op_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: Eval
 def _rename(node: Node, context: EvalContext) -> pl.LazyFrame:
     parent = node.inputs["input"]
     schema = context.infer_schema(parent)
+    plan = _rename_plan_from_schema(node, schema)
     value = _single_value_column(schema)
     alias = str(node.params["alias"])
-    return context.evaluate(parent).rename({value: alias})
+    return context.evaluate(parent).rename({value: alias}).select(list(plan.columns))
 
 
-@register_schema("rename")
-def _rename_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
-    parent = parent_schemas["input"]
+@register_plan("rename")
+def _rename_plan(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FramePlan:
+    return _rename_plan_from_schema(node, parent_schemas["input"])
+
+
+def _rename_plan_from_schema(node: Node, parent: FrameSchema) -> FramePlan:
     value = _single_value_column(parent)
     alias = str(node.params["alias"])
     columns = tuple(alias if column == value else column for column in parent.columns)
     info = _field_info_for_column(parent, value)
     fields = {alias: replace(info, name=alias, column=alias)}
-    return FrameSchema(columns=columns, keys=parent.keys, grain=parent.grain, fields=fields)
+    return FramePlan(columns=columns, keys=parent.keys, grain=parent.grain, fields=fields)
 
 
 def _frame_op(name: str, operands: list[Any], alias: str | None, params: dict[str, Any]) -> Node:
@@ -270,18 +281,26 @@ def _frame_op(name: str, operands: list[Any], alias: str | None, params: dict[st
 
 def _row_op(node: Node, context: EvalContext) -> pl.LazyFrame:
     parent = node.inputs["input"]
-    columns = list(context.infer_schema(parent).columns)
+    schema = context.infer_schema(parent)
+    plan = _op_plan(node, {"input": schema}, context)
+    columns = list(schema.columns)
     alias = str(node.params["alias"])
     expr = _expr_from_spec(dict(node.params["operands"][0]), columns)
     for spec in list(node.params["operands"])[1:]:
         expr = _combine_expr(str(node.params["name"]), expr, _expr_from_spec(dict(spec), columns))
-    return context.evaluate(parent).with_columns(expr.alias(alias))
+    return context.evaluate(parent).with_columns(expr.alias(alias)).select(list(plan.columns))
 
 
 def _frame_op_executor(node: Node, context: EvalContext) -> pl.LazyFrame:
     alias = str(node.params["alias"])
     operator = str(node.params["name"])
     specs = list(node.params["operands"])
+    parent_schemas = {
+        input_name: context.infer_schema(parent)
+        for input_name, parent in node.inputs.items()
+        if input_name.startswith("operand")
+    }
+    plan = _op_plan(node, parent_schemas, context)
     frames: list[pl.LazyFrame] = []
     keys: tuple[str, ...] | None = None
     expr_operands: list[pl.Expr] = []
@@ -294,7 +313,7 @@ def _frame_op_executor(node: Node, context: EvalContext) -> pl.LazyFrame:
             expr_operands.append(pl.lit(spec["value"]))
             continue
         input_name = str(spec["name"])
-        schema = context.infer_schema(node.inputs[input_name])
+        schema = parent_schemas[input_name]
         value = _single_value_column(schema)
         if keys is None:
             keys = schema.keys
@@ -329,10 +348,11 @@ def _frame_op_executor(node: Node, context: EvalContext) -> pl.LazyFrame:
             expr_operands,
             alias,
             int(node.params["window"]),
+            _cross_day_param(node),
             [*component_columns, *payload_columns],
         )
     out_expr = _combine_many(operator, expr_operands).alias(alias)
-    return frame.with_columns(out_expr).select([*keys, alias, *component_columns, *payload_columns])
+    return frame.with_columns(out_expr).select(list(plan.columns))
 
 
 def _window_op(
@@ -342,10 +362,11 @@ def _window_op(
     operands: list[pl.Expr],
     alias: str,
     window: int,
+    cross_day: bool,
     payload_columns: list[str],
 ) -> pl.LazyFrame:
     if keys == KEY_COLUMNS:
-        group_keys = list(DAILY_KEY_COLUMNS)
+        group_keys = ["secu_code"] if cross_day else list(DAILY_KEY_COLUMNS)
         order_keys = list(KEY_COLUMNS)
     elif keys == DAILY_KEY_COLUMNS:
         group_keys = ["secu_code"]
@@ -371,6 +392,19 @@ def _window_op(
     else:
         raise ValueError(f"Unsupported rolling operator {operator!r}.")
     return frame.sort(order_keys).with_columns(expr.alias(alias)).select([*keys, alias, *payload_columns])
+
+
+def _cross_day_param(node: Node) -> bool:
+    value = node.params.get("cross_day", False)
+    if not isinstance(value, bool):
+        raise ValueError("Rolling operator cross_day must be a boolean.")
+    return value
+
+
+def _validate_window_params(name: str, params: dict[str, Any]) -> None:
+    window = params.get("window")
+    if not isinstance(window, int) or isinstance(window, bool) or window < 1:
+        raise ValueError(f"{name} requires a positive integer window.")
 
 
 def _expr_op(name: str, left: Any, right: Any) -> OpExpr:

@@ -20,14 +20,6 @@ output = Aggregate("1d", "mean", value_col="close", alias="value")(filtered)
 model = Model(name="top_volume_close_mean", universe="ex2kamt", output=output)
 
 
-def trace_(engine: Engine) -> dict:
-    out = {}
-    for step in engine.trace(model, DATE):
-        key = " ".join([str(step.index), step.node.op, str(step.node.params), str(step.frame.shape)])
-        out[key] = step.frame
-    return out
-
-
 if __name__ == "__main__":
     engine = Engine(data_root=DATA_ROOT)
     print("\nFinal result")

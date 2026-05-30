@@ -40,9 +40,10 @@ def sample_root(tmp_path: Path) -> Path:
             "Price": [9.85, 10.1, 10.2, None, 10.5, 10.3, None, 10.85],
             "Side": [0, 0, 0, 0, 0, 0, 0, 0],
             "Volume": [10.0, 10.0, 5.0, 0.0, 30.0, 20.0, 0.0, 10.0],
-            "No": [1, 99, 1, 3, 4, 5, 6, 7],
+            "vw_wait_time": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             "isfirst": [True, True, False, True, True, True, True, True],
             "islast": [True, False, True, True, True, True, True, True],
+            "No": [1, 99, 1, 3, 4, 5, 6, 7],
         },
     )
     _write_parquet(

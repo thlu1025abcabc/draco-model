@@ -27,10 +27,25 @@ df = Engine(data_root="data").collect(model, dates=["20170103"])
 - `Project()` 显式丢弃 internal payload，只保留 key columns + public fields。
 - `FillNull(value)` 支持固定数值、`"ffill"` 和 `"state"`；`"state"` 使用 close_state 填 public field。
 
+`Engine.collect()` 只接受日频 factor 输出：输出必须是 `(date, secu_code)` grain，并包含 public `value` column。分钟级结果请先显式 `Aggregate("1d", ..., alias="value")`，或直接用 `Engine.evaluate()` / `Engine.trace()` 查看。
+
 除非显式运行 `Project()`，其他 layer 都会保留 internal payload。聚合类 layer 会把 payload 聚合到目标粒度；`FillNull()` 会保留 payload 列，但填充后的 public field 不再把旧 payload 标记为可重算 components。
+Payload 的当前特性：
+
+- `FillNull()` 后再次 `Aggregate()` 时，filled public field 以填充后的列为准；保留下来的 payload 仍可用于 lineage/debug，但旧 components 不再表示可以完整重算 filled public field。
+- `Aggregate(apply_to="field")` 会直接聚合 public field，并把 payload 一起保留到目标粒度；保留下来的 payload 不承诺可以完整重算聚合后的 public field，主要表达来源和调试信息。
+
 Public alias 和 `Join()` input name 不能以 `__` 开头，也不能使用 `date`、`secu_code`、`minute` 这些 key column 名。
 
 旧 public API 已删除：`Field`、`RatioField`、`Auction`、`Resample`、`DailyAgg`、`Concat` 不再导出。
+
+## Frame Plan 约定
+
+每个 frame layer 都需要注册一个 frame plan。Plan 是该 layer 输出列布局的单一事实源，负责定义 `columns`、`keys`、`grain` 和 `FieldInfo`：
+
+- schema inference 统一由 plan 派生，不再由 executor 结果反推。
+- executor 的最终输出列应按 plan columns `select`，避免 schema 和真实输出漂移。
+- 新增 layer 时，需要同时注册 executor 和 plan；复杂 layer 可以在 plan 中附带额外执行规格，例如 aggregate 的 value/component/payload specs。
 
 ## Metric Recipes
 
@@ -63,6 +78,23 @@ mean_minute_vwap = Aggregate("5m", "mean", apply_to="field")(vwap)
 row_amount = (Col("price") * Col("volume")).alias("amount")(raw)
 preclose = FillNull("state")(Metric("preclose", raw))
 ```
+
+## Rolling 语义
+
+`rolling_corr` / `rolling_beta` / `rolling_alpha` 通过 `Op(...)` 使用，例如：
+
+```python
+raw = Source("trades_tbar", lookback_days=5)
+amount = Metric("amount", raw)
+volume = Metric("volume", raw)
+
+intraday_corr = Op("rolling_corr", amount, volume, window=5, alias="corr_5")
+cross_day_corr = Op("rolling_corr", amount, volume, window=5, alias="corr_5_cross", cross_day=True)
+```
+
+- `cross_day=False` 是默认行为。分钟级 rolling 按 `(date, secu_code)` 分组，等价于日内重置。
+- `cross_day=True` 时，分钟级 rolling 只按 `secu_code` 分组，可以跨交易日使用上一日窗口。
+- `Source(..., lookback_days=...)` 由调用方显式指定；rolling operator 不会根据 `window` 自动扩大 lookback。
 
 ## Aggregate 语义
 
@@ -113,6 +145,14 @@ source 语义：
 
 source scan 会标准化常见 vendor column name，例如 `SecuCode -> secu_code`、`MinBar -> minute`、`Price -> price`、`Amount -> amount`、`Volume -> volume`、`No -> no`、`Side -> side`、`isfirst -> is_first`、`islast -> is_last`、`trading_day -> date`。
 
+`SourceCatalog.schema(source, dates)` 会优先使用固定 source schema，避免上层 schema inference 依赖 parquet scan。当前固定 schema：
+
+- `trades_tbar` / `cancels_tbar`：`secu_code`、`minute`、`price`、`side`、`volume`、`vw_wait_time`、`is_first`、`is_last`、`no`、`date`。
+- `quotes_tbar`：`secu_code`、`minute`、`price`、`side`、`volume`、`is_first`、`is_last`、`no`、`date`。
+- `daily_k`：`sec_code`、`date`、`open`、`high`、`low`、`close`、`shares`、`amount`、`limit_up`、`limit_down`、`preclose`、`isSuspend`、`isST`、`adjfactor`、`total_share`、`float_share`、`free_share`、`list_date`、`secu_code`。
+- `snapshot_tbar`：`AskPrice1`-`AskPrice10`、`BidPrice1`-`BidPrice10`、`AskVolume1`-`AskVolume10`、`BidVolume1`-`BidVolume10`、`aVOI1`-`aVOI5`、`secu_code`、`minute`、`date`。
+- `universe/ex2kamt`：`sec_code`、`preclose`、`close`、`adjfactor`、`secu_code`、`date`。
+
 ## Trace 和 Mermaid
 
 `Engine.trace(model, date)` 会按拓扑顺序 materialize 每个 frame node；`Model.explain_mermaid()` 会输出同一张 DAG。因为 metric 会展开，`amount`、`buyamount`、`vwap` 这类字段的内部 `where/op/aggregate` 都能在 trace 和图里看到。
@@ -127,9 +167,9 @@ python -m examples.preclose_fill_state_demo
 
 ## TODO
 
-- Source 层需要主动提供 normalized schema columns，例如 `SourceCatalog.schema(source, dates)`，减少上层 schema inference 对 `collect_schema()` 的依赖。
 - 后续 batch planner 需要合并多个 model / metric 中可复用的 source scan、operator branch 和 join。
 - 后续 optimizer 可以把同 source 的 `Metric("amount")`、`Metric("volume")`、`Metric("vwap")` fuse 成更少的 physical plan。
+- 评估是否需要 smart join：根据输入 grain、key 覆盖、source 复用和 public/payload 列需求，减少不必要的宽表 join、重复 scan 或中间 payload 搬运。
 - 继续思考 `close_state` 是否也进入 payload / operator metadata 体系。
-- 设计 `FillNull()` 后再次 `Aggregate()` 的 payload 语义：当前 `FillNull()` 会保留 payload，但不会把旧 components 标记为可重算；后续需要决定 filled public field 与 payload/components 的一致性策略。
-- 设计 `apply_to="field"` 后保留 payload 的二次聚合语义：当前 payload 会随 field aggregation 保留，但不保证可重算 public field；后续需要明确它是 lineage/debug，还是可参与后续计算的状态。
+- 再次整体评估 payload 是否应该默认保留：需要决定 payload 是继续作为跨 layer 的物理列传播，还是改为只在需要 trace/debug/组件重算时保留，或者在部分 layer 后默认 drop。
+- 重新设计 `Aggregate(apply_to="field")` 的 payload 处理：当前 payload 会被同一个 `agg` 聚合后保留，但这可能产生误导性的 lineage/debug 信息，后续需要决定是 drop、仅保留 metadata，还是为 payload 定义独立聚合策略。

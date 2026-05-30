@@ -8,7 +8,7 @@ from draco_model.layers.filters import Flag, Side, Where
 from draco_model.layers.names import validate_public_alias
 from draco_model.layers.operators import Col
 from draco_model.market.schema import KEY_COLUMNS
-from draco_model.runtime.execution import EvalContext, FieldInfo, FrameSchema, register_executor, register_schema
+from draco_model.runtime.execution import EvalContext, FieldInfo, FramePlan, FrameSchema, register_executor, register_plan
 
 
 def Metric(name: str, source: Node, *, alias: str | None = None) -> Node:
@@ -55,13 +55,12 @@ def _metric_reserved(node: Node, context: EvalContext) -> pl.LazyFrame:
     )
 
 
-@register_schema("metric_reserved")
-def _metric_reserved_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
-    source_schema = parent_schemas["input"]
+@register_plan("metric_reserved")
+def _metric_reserved_plan(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FramePlan:
     alias = str(node.params["alias"])
     source = _source_name(node.inputs["input"])
     lookback = int(node.inputs["input"].params.get("lookback_days", 1)) if node.inputs["input"].op == "source" else 1
-    return FrameSchema(
+    return FramePlan(
         columns=(*KEY_COLUMNS, alias),
         keys=KEY_COLUMNS,
         grain="minute",

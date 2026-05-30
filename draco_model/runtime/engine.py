@@ -9,12 +9,14 @@ from draco_model.data.source import SourceCatalog
 from draco_model.data.trading_calendar import TradingCalendar
 from draco_model.data.universe import UniverseCatalog
 from draco_model.market.minute_calendar import MinuteCalendar
+from draco_model.market.schema import DAILY_KEY_COLUMNS
 from draco_model.runtime.execution import (
     EvalContext,
     FrameSchema,
     TraceStep,
     format_factor_output,
     get_executor,
+    get_plan_builder,
     get_schema_inferer,
 )
 
@@ -46,6 +48,8 @@ class Engine:
         outputs = []
         for date in [_normalize_date(date) for date in dates]:
             self._grid_memory.clear()
+            schema = self._infer_schema(model, model.output, date)
+            _validate_collect_schema(schema)
             frame = self.evaluate(model, model.output, date)
             outputs.append(format_factor_output(frame, model.name, date))
         return pl.concat(outputs, how="vertical").collect()
@@ -137,6 +141,9 @@ class Engine:
             infer_schema=lambda parent: self._infer_schema(model, parent, eval_date),
             grid_cache=self._grid_memory,
         )
+        planner = get_plan_builder(node.op)
+        if planner is not None:
+            return planner(node, parent_schemas, context).schema()
         inferer = get_schema_inferer(node.op)
         if inferer is not None:
             return inferer(node, parent_schemas, context)
@@ -145,3 +152,13 @@ class Engine:
 
 def _normalize_date(value: object) -> str:
     return str(value).replace("-", "")
+
+
+def _validate_collect_schema(schema: FrameSchema) -> None:
+    if schema.keys != DAILY_KEY_COLUMNS or schema.grain != "daily":
+        raise ValueError(
+            "Engine.collect requires a daily output with date/secu_code keys; "
+            f"got grain={schema.grain!r}, keys={schema.keys!r}."
+        )
+    if "value" not in schema.value_columns():
+        raise ValueError("Engine.collect requires a public 'value' column.")

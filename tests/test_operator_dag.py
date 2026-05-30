@@ -6,9 +6,10 @@ import polars as pl
 import pytest
 
 from draco_model import Engine, Model
-from draco_model.layers import Aggregate, Col, FillNull, Join, Metric, Op, Project, Side, Source, Where
+from draco_model.layers import Aggregate, Col, FillNull, Join, Metric, Op, Project, Side, Source, Threshold, Where
 from draco_model.layers.aggregate import _auction_merge_targets
 from draco_model.market.minute_calendar import MinuteCalendar
+from draco_model.runtime.execution import get_plan_builder
 
 
 class _Context:
@@ -75,6 +76,20 @@ def test_buyamount_expands_to_side_filter_and_product(tmp_path: Path) -> None:
     assert buy["buyamount"].to_list() == pytest.approx([100.0])
     assert sell["sellamount"].to_list() == pytest.approx([200.0])
     assert total["amount"].to_list() == pytest.approx([300.0])
+
+
+def test_threshold_filter_keeps_matching_rows(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    filtered = Where(Threshold("volume", op=">", value=10))(raw)
+
+    frame = Engine(data_root=sample_root).evaluate(
+        Model("large_volume_rows", "ex2kamt", filtered),
+        filtered,
+        "20170103",
+    ).collect()
+
+    rows = frame.select(["minute", "volume"]).sort("minute").to_dict(as_series=False)
+    assert rows == {"minute": [932, 933], "volume": [30.0, 20.0]}
 
 
 def test_vwap_component_and_field_aggregation(sample_root: Path) -> None:
@@ -183,6 +198,35 @@ def test_rolling_operator_uses_generic_op(sample_root: Path) -> None:
     assert {"__op_corr_2_0", "__op_corr_2_1"}.issubset(frame.columns)
 
 
+def test_rolling_operator_requires_window() -> None:
+    raw = Source("trades_tbar")
+    amount = Metric("amount", raw)
+    volume = Metric("volume", raw)
+
+    with pytest.raises(ValueError, match="requires a positive integer window"):
+        Op("rolling_corr", amount, volume)
+    with pytest.raises(ValueError, match="requires a positive integer window"):
+        Op("rolling_corr", amount, volume, window=0)
+
+
+def test_rolling_cross_day_option_controls_minute_grouping(tmp_path: Path) -> None:
+    _write_two_day_rolling_fixture(tmp_path)
+    raw = Source("trades_tbar", lookback_days=2)
+    amount = Metric("amount", raw)
+    volume = Metric("volume", raw)
+    reset = Op("rolling_corr", amount, volume, window=2, alias="corr")
+    cross_day = Op("rolling_corr", amount, volume, window=2, alias="corr", cross_day=True)
+    engine = Engine(data_root=tmp_path / "data")
+
+    reset_frame = engine.evaluate(Model("reset_corr", "ex2kamt", reset), reset, "20170104").collect()
+    cross_frame = engine.evaluate(Model("cross_corr", "ex2kamt", cross_day), cross_day, "20170104").collect()
+
+    reset_value = reset_frame.filter((pl.col("date") == "20170104") & (pl.col("minute") == 930))["corr"].to_list()
+    cross_value = cross_frame.filter((pl.col("date") == "20170104") & (pl.col("minute") == 930))["corr"].to_list()
+    assert reset_value == [None]
+    assert cross_value == pytest.approx([1.0])
+
+
 def test_nested_operator_preserves_parent_payload(sample_root: Path) -> None:
     raw = Source("trades_tbar")
     vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
@@ -232,6 +276,22 @@ def test_fillnull_state_for_vwap_and_preclose(sample_root: Path) -> None:
     assert vwap_frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 935))["vwap"].to_list() == [10.3]
     assert preclose_frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 930))["preclose"].to_list() == [9.85]
     assert any(column.startswith("__op_vwap") for column in vwap_frame.columns)
+
+
+def test_fillnull_ffill_and_numeric_modes(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    close = Metric("close", raw)
+    ffilled = FillNull("ffill")(close)
+    zero_filled = FillNull(0)(close)
+    engine = Engine(data_root=sample_root)
+
+    ffilled_frame = engine.evaluate(Model("ffill_close", "ex2kamt", ffilled), ffilled, "20170103").collect()
+    zero_frame = engine.evaluate(Model("zero_close", "ex2kamt", zero_filled), zero_filled, "20170103").collect()
+
+    assert ffilled_frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 931))["close"].to_list() == [10.2]
+    assert ffilled_frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 935))["close"].to_list() == [10.3]
+    assert zero_frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 931))["close"].to_list() == [0.0]
+    assert zero_frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 935))["close"].to_list() == [0.0]
 
 
 def test_daily_aggregate_preserves_payload_until_project(sample_root: Path) -> None:
@@ -297,6 +357,32 @@ def test_collect_daily_output(sample_root: Path) -> None:
     }
 
 
+def test_collect_concatenates_multiple_dates(tmp_path: Path) -> None:
+    _write_two_day_collect_fixture(tmp_path)
+    raw = Source("trades_tbar")
+    output = Aggregate("1d", "last", value_col="close", alias="value")(Metric("close", raw))
+
+    result = Engine(data_root=tmp_path / "data").collect(
+        Model("close_last", "ex2kamt", output),
+        dates=["20170103", "20170104"],
+    )
+
+    assert result.sort("date").to_dict(as_series=False) == {
+        "date": ["20170103", "20170104"],
+        "secu_code": [1, 1],
+        "factor_name": ["close_last", "close_last"],
+        "value": [10.0, 20.0],
+    }
+
+
+def test_collect_rejects_minute_output_even_with_value_column(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    output = Metric("volume", raw, alias="value")
+
+    with pytest.raises(ValueError, match="requires a daily output"):
+        Engine(data_root=sample_root).collect(Model("minute_value", "ex2kamt", output), dates=["20170103"])
+
+
 def test_trace_and_mermaid_show_expanded_operator_dag(sample_root: Path) -> None:
     raw = Source("trades_tbar")
     model = Model("trace_vwap", "ex2kamt", (Metric("amount", raw) / Metric("volume", raw)).alias("vwap"))
@@ -307,6 +393,47 @@ def test_trace_and_mermaid_show_expanded_operator_dag(sample_root: Path) -> None
     assert [step.node.op for step in steps] == ["source", "op", "aggregate", "column", "aggregate", "op"]
     assert "op" in mermaid
     assert "ratio_field" not in mermaid
+
+
+def test_frame_plans_match_materialized_columns(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
+    filled = FillNull("state")(vwap)
+    corr = Op("rolling_corr", Metric("amount", raw), Metric("volume", raw), window=2, alias="corr")
+    daily = Aggregate("1d", "mean", value_col="vwap", alias="daily_vwap")(vwap)
+    output = Project()(Join()({"filled": filled, "corr": corr, "daily": daily}))
+    model = Model("plan_columns", "ex2kamt", output)
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+
+    for node in model.nodes():
+        if node.kind != "frame":
+            continue
+        schema = engine._infer_schema(model, node, "20170103")
+        frame = engine.evaluate(model, node, "20170103").collect()
+        assert tuple(frame.columns) == schema.columns
+
+
+def test_builtin_frame_layers_register_plans() -> None:
+    for op in ["aggregate", "column", "fill_null", "join", "metric_reserved", "op", "project", "rename", "source", "where"]:
+        assert get_plan_builder(op) is not None
+
+
+def test_join_evaluates_distinct_sources(tmp_path: Path) -> None:
+    _write_multi_source_fixture(tmp_path)
+    trade_volume = Metric("volume", Source("trades_tbar"))
+    quote_volume = Metric("volume", Source("quotes_tbar"))
+    joined = Join()({"trade_volume": trade_volume, "quote_volume": quote_volume})
+
+    frame = Engine(data_root=tmp_path / "data").evaluate(
+        Model("multi_source", "ex2kamt", joined),
+        joined,
+        "20170103",
+    ).collect()
+
+    row = frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 930))
+    assert row["trade_volume"].to_list() == [10.0]
+    assert row["quote_volume"].to_list() == [7.0]
 
 
 def _write_market_fixture(tmp_path: Path) -> None:
@@ -322,15 +449,95 @@ def _write_market_fixture(tmp_path: Path) -> None:
             "SecuCode": [1, 1],
             "MinBar": [930, 930],
             "Price": [10.0, 20.0],
-            "Amount": [999.0, 999.0],
-            "Volume": [10.0, 10.0],
-            "No": [1, 1],
             "Side": [0, 1],
+            "Volume": [10.0, 10.0],
+            "vw_wait_time": [0.0, 0.0],
             "isfirst": [True, True],
             "islast": [True, True],
+            "No": [1, 1],
         }
     ).write_parquet(data / "trades_tbar" / "20170103.parquet")
     (data / "daily_k").mkdir()
     pl.DataFrame({"sec_code": ["000001.SZ"], "trading_day": ["2017-01-03"], "preclose": [9.5]}).write_parquet(
         data / "daily_k" / "20170103.parquet"
     )
+
+
+def _write_two_day_rolling_fixture(tmp_path: Path) -> None:
+    external = tmp_path / "external"
+    data = tmp_path / "data"
+    external.mkdir()
+    pl.DataFrame({"date": ["20170103", "20170104"]}).write_parquet(external / "trading_days.parquet")
+    (data / "universe" / "ex2kamt").mkdir(parents=True)
+    pl.DataFrame({"secu_code": [1]}).write_parquet(data / "universe" / "ex2kamt" / "20170104.parquet")
+    (data / "trades_tbar").mkdir()
+    for date, volumes in {"20170103": [1.0, 2.0], "20170104": [3.0, 4.0]}.items():
+        pl.DataFrame(
+            {
+                "SecuCode": [1, 1],
+                "MinBar": [930, 931],
+                "Price": [10.0, 10.0],
+                "Side": [0, 0],
+                "Volume": volumes,
+                "vw_wait_time": [0.0, 0.0],
+                "isfirst": [True, True],
+                "islast": [True, True],
+                "No": [1, 1],
+            }
+        ).write_parquet(data / "trades_tbar" / f"{date}.parquet")
+
+
+def _write_two_day_collect_fixture(tmp_path: Path) -> None:
+    external = tmp_path / "external"
+    data = tmp_path / "data"
+    external.mkdir()
+    pl.DataFrame({"date": ["20170103", "20170104"]}).write_parquet(external / "trading_days.parquet")
+    (data / "trades_tbar").mkdir(parents=True)
+    for date, price in {"20170103": 10.0, "20170104": 20.0}.items():
+        pl.DataFrame(
+            {
+                "SecuCode": [1],
+                "MinBar": [930],
+                "Price": [price],
+                "Side": [0],
+                "Volume": [1.0],
+                "vw_wait_time": [0.0],
+                "isfirst": [True],
+                "islast": [True],
+                "No": [1],
+            }
+        ).write_parquet(data / "trades_tbar" / f"{date}.parquet")
+
+
+def _write_multi_source_fixture(tmp_path: Path) -> None:
+    external = tmp_path / "external"
+    data = tmp_path / "data"
+    external.mkdir()
+    pl.DataFrame({"date": ["20170103"]}).write_parquet(external / "trading_days.parquet")
+    (data / "trades_tbar").mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "SecuCode": [1],
+            "MinBar": [930],
+            "Price": [10.0],
+            "Side": [0],
+            "Volume": [10.0],
+            "vw_wait_time": [0.0],
+            "isfirst": [True],
+            "islast": [True],
+            "No": [1],
+        }
+    ).write_parquet(data / "trades_tbar" / "20170103.parquet")
+    (data / "quotes_tbar").mkdir()
+    pl.DataFrame(
+        {
+            "SecuCode": [1],
+            "MinBar": [930],
+            "Price": [10.0],
+            "Side": [0],
+            "Volume": [7.0],
+            "isfirst": [True],
+            "islast": [True],
+            "No": [1],
+        }
+    ).write_parquet(data / "quotes_tbar" / "20170103.parquet")
