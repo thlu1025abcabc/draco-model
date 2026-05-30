@@ -25,6 +25,52 @@ class Node:
     def __hash__(self) -> int:
         return hash(self.id)
 
+    def alias(self, name: str) -> "Node":
+        """Return this frame node with a new public output alias where supported."""
+        from draco_model.layers.operators import alias_node
+
+        return alias_node(self, name)
+
+    def __add__(self, other: Any) -> "Node":
+        from draco_model.layers.operators import Op
+
+        return Op("add", self, other)
+
+    def __radd__(self, other: Any) -> "Node":
+        from draco_model.layers.operators import Op
+
+        return Op("add", other, self)
+
+    def __sub__(self, other: Any) -> "Node":
+        from draco_model.layers.operators import Op
+
+        return Op("sub", self, other)
+
+    def __rsub__(self, other: Any) -> "Node":
+        from draco_model.layers.operators import Op
+
+        return Op("sub", other, self)
+
+    def __mul__(self, other: Any) -> "Node":
+        from draco_model.layers.operators import Op
+
+        return Op("mul", self, other)
+
+    def __rmul__(self, other: Any) -> "Node":
+        from draco_model.layers.operators import Op
+
+        return Op("mul", other, self)
+
+    def __truediv__(self, other: Any) -> "Node":
+        from draco_model.layers.operators import Op
+
+        return Op("div", self, other)
+
+    def __rtruediv__(self, other: Any) -> "Node":
+        from draco_model.layers.operators import Op
+
+        return Op("div", other, self)
+
 
 class Layer:
     """Base class for graph layers that turn input nodes into output nodes."""

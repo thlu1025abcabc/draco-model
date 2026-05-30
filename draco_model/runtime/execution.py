@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, MutableMapping
 
 import polars as pl
@@ -22,9 +22,32 @@ _SCHEMA_INFERERS: dict[str, SchemaInferer] = {}
 
 @dataclass(frozen=True)
 class FrameSchema:
-    """Column contract for a frame node."""
+    """Logical and physical column contract for a frame node."""
 
     columns: tuple[str, ...]
+    keys: tuple[str, ...] = ()
+    grain: str = "unknown"
+    fields: dict[str, "FieldInfo"] = field(default_factory=dict)
+
+    def value_columns(self) -> list[str]:
+        """Return public value columns, excluding keys and internal payload."""
+        if self.fields:
+            return [info.column for info in self.fields.values()]
+        keys = set(self.keys)
+        return [column for column in self.columns if column not in keys and not column.startswith("__")]
+
+
+@dataclass(frozen=True)
+class FieldInfo:
+    """Metadata for one public field inside a frame."""
+
+    name: str
+    column: str
+    operator: str = "identity"
+    components: tuple[str, ...] = ()
+    source: str | None = None
+    lookback_days: int = 1
+    component_agg: bool = False
 
 
 @dataclass(frozen=True)

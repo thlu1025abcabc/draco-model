@@ -1,310 +1,84 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import replace
 
 import polars as pl
 
 from draco_model.core import Layer, Node
-from draco_model.layers.aggregate import (
-    APPLY_TO_COMPONENTS,
-    APPLY_TO_FIELD,
-    aggregate_frame,
-    aggregate_input_columns,
-    aggregate_value_columns,
-    parse_minute_frequency,
-    ratio_payload_columns,
-    ratio_payloads,
-    resample_columns,
-    resample_frame,
-)
-from draco_model.layers.inputs.field import Field
-from draco_model.layers.inputs.input import Input
-from draco_model.market.minute_calendar import AUCTION_MINUTES
 from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
-from draco_model.runtime.execution import EvalContext, FrameSchema, register_executor, register_schema
+from draco_model.runtime.execution import EvalContext, FieldInfo, FrameSchema, register_executor, register_schema
 
 
-class Fill(Layer):
-    """Fill missing values with an explicit rule."""
+class FillNull(Layer):
+    """Fill nulls in a single public field."""
 
-    op = "fill"
+    op = "fill_null"
 
     def __init__(self, value: int | float | str = "state", *, name: str | None = None) -> None:
         super().__init__(name=name, value=value)
 
-    def __call__(self, inputs: Node) -> Node:
-        """Build a fill node, including explicit close_state dependency for state fill."""
-        if self.params.get("value") != "state":
-            return super().__call__(inputs)
-        lineage = _parse_state_fill_lineage(inputs)
-        return Node(
-            kind=self.output_kind,
-            op=self.op,
-            params=dict(self.params),
-            inputs={"input": inputs, "close_state": _build_close_state_subtree(lineage)},
-            name=self.name,
-        )
+    def __call__(self, frame: Node) -> Node:
+        inputs = {"input": frame}
+        if self.params.get("value") == "state":
+            source = _find_unique_source(frame)
+            if source is not None:
+                source_name, lookback = source
+                inputs["close_state"] = _build_close_state_subtree(source_name, lookback, _aggregate_transforms(frame))
+        return Node(kind="frame", op=self.op, params=dict(self.params), inputs=inputs, name=self.name)
 
 
-class Auction(Layer):
-    """Handle auction minutes without relying on input policies."""
-
-    op = "auction"
-
-    def __init__(
-        self,
-        mode: str,
-        agg: str | None = None,
-        *,
-        apply_to: str = APPLY_TO_COMPONENTS,
-        name: str | None = None,
-    ) -> None:
-        if mode not in {"drop", "merge"}:
-            raise ValueError("auction mode must be 'drop' or 'merge'.")
-        if apply_to not in {APPLY_TO_COMPONENTS, APPLY_TO_FIELD}:
-            raise ValueError("apply_to must be 'components' or 'field'.")
-        super().__init__(
-            name=name,
-            mode=mode,
-            agg=agg,
-            apply_to=None if apply_to == APPLY_TO_COMPONENTS else apply_to,
-        )
-
-
-class Resample(Layer):
-    """Resample minute bars using one explicit aggregation method."""
-
-    op = "resample"
-
-    def __init__(
-        self,
-        frequency: str,
-        agg: str,
-        *,
-        apply_to: str = APPLY_TO_COMPONENTS,
-        name: str | None = None,
-    ) -> None:
-        if apply_to not in {APPLY_TO_COMPONENTS, APPLY_TO_FIELD}:
-            raise ValueError("apply_to must be 'components' or 'field'.")
-        super().__init__(
-            name=name,
-            frequency=frequency,
-            agg=agg,
-            apply_to=None if apply_to == APPLY_TO_COMPONENTS else apply_to,
-        )
-
-
-@register_executor("fill")
-def _fill_executor(node: Node, context: EvalContext) -> pl.LazyFrame:
-    value = node.params.get("value", "state")
+@register_executor("fill_null")
+def _fill_null(node: Node, context: EvalContext) -> pl.LazyFrame:
     parent = node.inputs["input"]
-    parent_columns = list(context.infer_schema(parent).columns)
+    schema = context.infer_schema(parent)
+    value = node.params.get("value", "state")
+    value_col = _single_value_column(schema)
+    info = _field_for_column(schema, value_col)
+
     if _is_numeric_fill(value):
-        return _fill_literal(context.evaluate(parent), parent_columns, value)
+        return context.evaluate(parent).with_columns(pl.col(value_col).fill_null(value).alias(value_col))
     if value == "ffill":
-        return _fill_forward(context.evaluate(parent), parent_columns)
+        return (
+            context.evaluate(parent)
+            .sort(list(schema.keys))
+            .with_columns(pl.col(value_col).forward_fill().over(list(DAILY_KEY_COLUMNS)).alias(value_col))
+        )
     if value != "state":
-        raise ValueError("Fill supports numeric literals, 'ffill', or 'state'.")
+        raise ValueError("FillNull supports numeric literals, 'ffill', or 'state'.")
 
-    lineage = _parse_state_fill_lineage(parent)
-    try:
-        close_state_node = node.inputs["close_state"]
-    except KeyError:
-        raise ValueError("Fill('state') node is missing its explicit close_state input.") from None
-    state = _close_state_from_close(context.evaluate(close_state_node), lineage, context)
-
-    if lineage.field == "preclose":
-        return _preclose_from_state(state, lineage.output_column)
-
-    frame = context.evaluate(parent)
-    value_columns = aggregate_value_columns(parent_columns, KEY_COLUMNS)
-    if len(value_columns) != 1:
-        raise ValueError(f"Fill('state') requires exactly one value column, got {value_columns}.")
-    value_column = value_columns[0]
+    close_state = _close_state_from_node(node, info, context)
+    if info.operator == "preclose":
+        return _preclose_from_state(close_state, info.column)
     return (
-        frame.join(state.select([*KEY_COLUMNS, "__close_state"]), on=list(KEY_COLUMNS), how="left")
-        .with_columns(pl.col(value_column).fill_null(pl.col("__close_state")).alias(value_column))
+        context.evaluate(parent)
+        .join(close_state.select([*KEY_COLUMNS, "__close_state"]), on=list(KEY_COLUMNS), how="left")
+        .with_columns(pl.col(value_col).fill_null(pl.col("__close_state")).alias(value_col))
         .drop("__close_state")
-        .drop(ratio_payload_columns(ratio_payloads([value_column], parent_columns)))
     )
 
 
-def _fill_literal(frame: pl.LazyFrame, columns: list[str], value: int | float) -> pl.LazyFrame:
-    value_column = _single_value_column(columns, f"Fill({value!r})")
-    payloads = ratio_payloads([value_column], columns)
-    return frame.with_columns(pl.col(value_column).fill_null(value).alias(value_column)).drop(
-        ratio_payload_columns(payloads)
-    )
-
-
-def _fill_forward(frame: pl.LazyFrame, columns: list[str]) -> pl.LazyFrame:
-    value_column = _single_value_column(columns, "Fill('ffill')")
-    payloads = ratio_payloads([value_column], columns)
-    frame = frame.sort(list(KEY_COLUMNS))
-    if value_column not in payloads:
-        return frame.with_columns(pl.col(value_column).forward_fill().over(list(DAILY_KEY_COLUMNS)).alias(value_column))
-    numerator, denominator = payloads[value_column]
-    return frame.with_columns(
-        [
-            pl.col(numerator).forward_fill().over(list(DAILY_KEY_COLUMNS)).alias(numerator),
-            pl.col(denominator).forward_fill().over(list(DAILY_KEY_COLUMNS)).alias(denominator),
-        ]
-    ).with_columns(_ratio_expr(numerator, denominator).alias(value_column))
-
-
-@register_executor("auction")
-def _auction_executor(node: Node, context: EvalContext) -> pl.LazyFrame:
-    parent = node.inputs["input"]
-    return _auction_frame(
-        context.evaluate(parent),
-        str(node.params["mode"]),
-        node.params.get("agg"),
-        list(context.infer_schema(parent).columns),
-        str(node.params.get("apply_to", APPLY_TO_COMPONENTS)),
-    )
-
-
-def _auction_frame(
-    frame: pl.LazyFrame,
-    mode: str,
-    agg: object | None = None,
-    columns: list[str] | None = None,
-    apply_to: str = APPLY_TO_COMPONENTS,
-) -> pl.LazyFrame:
-    columns = columns or frame.collect_schema().names()
-    if mode == "drop":
-        return frame.filter(~pl.col("minute").is_in(AUCTION_MINUTES))
-    if mode == "merge":
-        if agg not in {"first", "last", "sum"}:
-            raise ValueError("Auction('merge') requires agg to be 'first', 'last', or 'sum'.")
-        value_columns = aggregate_value_columns(columns, KEY_COLUMNS)
-        if not value_columns:
-            raise ValueError("Auction('merge') input has no value columns to aggregate.")
-        pass_columns = aggregate_input_columns(columns, value_columns, apply_to)
-        remapped = frame.select([*KEY_COLUMNS, *pass_columns]).with_columns(
-            [
-                pl.col("minute").alias("__order_minute"),
-                pl.when(pl.col("minute") == 925)
-                .then(930)
-                .when(pl.col("minute") == 1456)
-                .then(1500)
-                .otherwise(pl.col("minute"))
-                .alias("minute"),
-            ]
-        )
-        return aggregate_frame(
-            remapped,
-            columns,
-            value_columns,
-            str(agg),
-            group_keys=KEY_COLUMNS,
-            apply_to=apply_to,
-            order_col="__order_minute",
-            keep_payload=apply_to == APPLY_TO_COMPONENTS,
-        )
-    raise ValueError("auction mode must be 'drop' or 'merge'.")
-
-
-@register_executor("resample")
-def _resample_executor(node: Node, context: EvalContext) -> pl.LazyFrame:
-    parent = node.inputs["input"]
-    return resample_frame(
-        context.evaluate(parent),
-        list(context.infer_schema(parent).columns),
-        str(node.params["frequency"]),
-        str(node.params["agg"]),
-        context,
-        apply_to=str(node.params.get("apply_to", APPLY_TO_COMPONENTS)),
-    )
-
-
-@register_schema("fill")
-def _fill_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
-    columns = list(parent_schemas["input"].columns)
-    value = node.params.get("value", "state")
-    if value == "ffill":
-        return FrameSchema(tuple(columns))
-    value_column = _single_value_column(columns, f"Fill({value!r})")
-    payload_columns = set(ratio_payload_columns(ratio_payloads([value_column], columns)))
-    return FrameSchema(tuple(column for column in columns if column not in payload_columns))
-
-
-@register_schema("auction")
-def _auction_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
-    if node.params.get("mode") != "merge" or node.params.get("apply_to", APPLY_TO_COMPONENTS) == APPLY_TO_COMPONENTS:
-        return parent_schemas["input"]
-    columns = list(parent_schemas["input"].columns)
-    return FrameSchema(tuple([*KEY_COLUMNS, *aggregate_value_columns(columns, KEY_COLUMNS)]))
-
-
-@register_schema("resample")
-def _resample_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
-    frequency = str(node.params["frequency"])
-    if parse_minute_frequency(frequency) == 1:
-        return parent_schemas["input"]
+@register_schema("fill_null")
+def _fill_null_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
+    parent = parent_schemas["input"]
+    value_col = _single_value_column(parent)
+    info = _field_for_column(parent, value_col)
     return FrameSchema(
-        tuple(
-            resample_columns(
-                list(parent_schemas["input"].columns),
-                str(node.params.get("apply_to", APPLY_TO_COMPONENTS)),
-                None,
-                None,
-            )
-        )
+        columns=parent.columns,
+        keys=parent.keys,
+        grain=parent.grain,
+        fields={value_col: replace(info, name=value_col, column=value_col, components=(), component_agg=False)},
     )
 
 
-@dataclass(frozen=True)
-class _StateFillLineage:
-    source: str
-    lookback_days: int
-    field: str
-    output_column: str
-    transforms: tuple[Node, ...]
-
-
-def _parse_state_fill_lineage(node: Node) -> _StateFillLineage:
-    transforms: list[Node] = []
-    current = node
-    while current.op in {"auction", "resample"}:
-        transforms.append(current)
-        current = current.inputs["input"]
-
-    if current.op == "field":
-        field = str(current.params["name"])
-        output_column = str(current.params.get("alias") or field)
-    elif current.op == "ratio_field":
-        output_column = str(current.params["alias"])
-        field = output_column
+def _close_state_from_node(node: Node, info: FieldInfo, context: EvalContext) -> pl.LazyFrame:
+    if "close_state" in node.inputs:
+        close_node = node.inputs["close_state"]
     else:
-        raise ValueError("Fill('state') requires a Field(...) or RatioField(...) input chain.")
-    source_node = current.inputs["input"]
-    if source_node.op != "input":
-        raise ValueError("Fill('state') requires Field(...) to read from Input(source=...).")
-    return _StateFillLineage(
-        source=str(source_node.params["source"]),
-        lookback_days=int(source_node.params.get("lookback_days", 1)),
-        field=field,
-        output_column=output_column,
-        transforms=tuple(reversed(transforms)),
-    )
-
-
-def _build_close_state_subtree(lineage: _StateFillLineage) -> Node:
-    node = Field("close")(Input(source=lineage.source, lookback_days=lineage.lookback_days))
-    for transform in lineage.transforms:
-        if transform.op == "auction":
-            mode = str(transform.params["mode"])
-            node = Auction(mode, agg="last" if mode == "merge" else None)(node)
-        elif transform.op == "resample":
-            node = Resample(str(transform.params["frequency"]), "last")(node)
-        else:
-            raise ValueError(f"Fill('state') cannot replay transform {transform.op!r}.")
-    return node
-
-
-def _close_state_from_close(close: pl.LazyFrame, lineage: _StateFillLineage, context: EvalContext) -> pl.LazyFrame:
-    dates = context.trading_calendar.previous_sessions(context.eval_date, lineage.lookback_days)
+        if info.source is None:
+            raise ValueError("FillNull('state') requires source lineage.")
+        close_node = _build_close_state_subtree(info.source, info.lookback_days, ())
+    close = context.evaluate(close_node)
+    dates = context.trading_calendar.previous_sessions(context.eval_date, info.lookback_days)
     daily_preclose = _daily_preclose_frame(context, dates)
     return (
         close.join(daily_preclose, on=list(DAILY_KEY_COLUMNS), how="left")
@@ -343,16 +117,59 @@ def _daily_preclose_frame(context: EvalContext, dates: list[str]) -> pl.LazyFram
     return frame.select([*DAILY_KEY_COLUMNS, pl.col("preclose").alias("__daily_preclose")])
 
 
-def _single_value_column(columns: list[str], subject: str) -> str:
-    value_columns = aggregate_value_columns(columns, KEY_COLUMNS)
-    if len(value_columns) != 1:
-        raise ValueError(f"{subject} requires exactly one value column, got {value_columns}.")
-    return value_columns[0]
+def _build_close_state_subtree(source_name: str, lookback_days: int, transforms: tuple[dict, ...]) -> Node:
+    from draco_model.layers.aggregate import Aggregate
+    from draco_model.layers.metrics import Metric
+    from draco_model.layers.source import Source
+
+    node = Metric("close", Source(source_name, lookback_days=lookback_days))
+    for params in transforms:
+        node = Aggregate(
+            str(params["frequency"]),
+            "last",
+            auction=str(params.get("auction", "keep")),
+            apply_to="field",
+        )(node)
+    return node
+
+
+def _aggregate_transforms(node: Node) -> tuple[dict, ...]:
+    transforms: list[dict] = []
+    current = node
+    while current.op == "aggregate":
+        transforms.append(dict(current.params))
+        current = current.inputs["input"]
+    return tuple(reversed(transforms))
+
+
+def _find_unique_source(node: Node) -> tuple[str, int] | None:
+    found: set[tuple[str, int]] = set()
+
+    def visit(item: Node) -> None:
+        if item.op == "source":
+            found.add((str(item.params["source"]), int(item.params.get("lookback_days", 1))))
+            return
+        for parent in item.inputs.values():
+            if parent.kind == "frame":
+                visit(parent)
+
+    visit(node)
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def _single_value_column(schema: FrameSchema) -> str:
+    values = schema.value_columns()
+    if len(values) != 1:
+        raise ValueError(f"FillNull requires exactly one public value column, got {values}.")
+    return values[0]
+
+
+def _field_for_column(schema: FrameSchema, column: str) -> FieldInfo:
+    for info in schema.fields.values():
+        if info.column == column:
+            return info
+    return FieldInfo(column, column)
 
 
 def _is_numeric_fill(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-def _ratio_expr(numerator: str, denominator: str) -> pl.Expr:
-    return pl.when(pl.col(denominator) == 0).then(None).otherwise(pl.col(numerator) / pl.col(denominator))

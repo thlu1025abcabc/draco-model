@@ -4,9 +4,11 @@ import polars as pl
 
 from draco_model.core import Layer, Node
 from draco_model.layers.expressions import sum_or_null
+from draco_model.layers.names import validate_public_alias
+from draco_model.layers.operators import ARITHMETIC_OPS
 from draco_model.market.minute_calendar import AUCTION_MINUTES
 from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
-from draco_model.runtime.execution import EvalContext, FrameSchema, register_executor, register_schema
+from draco_model.runtime.execution import EvalContext, FieldInfo, FrameSchema, register_executor, register_schema
 
 
 APPLY_TO_COMPONENTS = "components"
@@ -15,7 +17,7 @@ DAILY_FREQUENCIES = {"1d", "daily"}
 
 
 class Aggregate(Layer):
-    """Aggregate frame values to another time frequency."""
+    """Aggregate raw, minute, or daily fields to a target frequency."""
 
     op = "aggregate"
 
@@ -27,10 +29,15 @@ class Aggregate(Layer):
         apply_to: str = APPLY_TO_FIELD,
         value_col: str | None = None,
         alias: str | None = None,
+        auction: str = "keep",
         name: str | None = None,
     ) -> None:
-        """Create a frequency-aware aggregation node."""
-        apply_to = _normalize_apply_to(apply_to)
+        if apply_to not in {APPLY_TO_COMPONENTS, APPLY_TO_FIELD}:
+            raise ValueError("apply_to must be 'components' or 'field'.")
+        if auction not in {"keep", "drop", "merge"}:
+            raise ValueError("auction must be 'keep', 'drop', or 'merge'.")
+        if alias is not None:
+            validate_public_alias(alias)
         super().__init__(
             name=name,
             frequency=frequency,
@@ -38,312 +45,291 @@ class Aggregate(Layer):
             apply_to=apply_to,
             value_col=value_col,
             alias=alias,
-        )
-
-
-class DailyAgg(Layer):
-    """Aggregate an intraday value column into daily factor values."""
-
-    op = "daily_agg"
-
-    def __init__(
-        self,
-        *,
-        value_col: str,
-        agg: str,
-        apply_to: str = APPLY_TO_FIELD,
-        name: str | None = None,
-    ) -> None:
-        """Create a daily aggregation node for one input value column."""
-        apply_to = _normalize_apply_to(apply_to)
-        super().__init__(
-            name=name,
-            value_col=value_col,
-            agg=agg,
-            apply_to=None if apply_to == APPLY_TO_FIELD else apply_to,
+            auction=None if auction == "keep" else auction,
         )
 
 
 @register_executor("aggregate")
 def _aggregate(node: Node, context: EvalContext) -> pl.LazyFrame:
+    parent = node.inputs["input"]
+    schema = context.infer_schema(parent)
+    frame = context.evaluate(parent)
     frequency = str(node.params["frequency"]).strip().lower()
-    frame = context.evaluate(node.inputs["input"])
-    columns = list(context.infer_schema(node.inputs["input"]).columns)
-    apply_to = _normalize_apply_to(str(node.params.get("apply_to", APPLY_TO_FIELD)))
+    agg = str(node.params["agg"])
+    apply_to = str(node.params.get("apply_to", APPLY_TO_FIELD))
+    value_col = node.params.get("value_col")
+    alias = node.params.get("alias")
+    auction = str(node.params.get("auction", "keep"))
+
     if frequency in DAILY_FREQUENCIES:
-        return _daily_aggregate(
+        if "minute" in schema.columns:
+            frame = frame.with_columns(pl.col("minute").alias("__order_minute"))
+            frame = _apply_auction(frame, auction, context, 1)
+            if auction == "merge":
+                frame, schema = _merge_auction_frame(frame, schema, agg, apply_to, value_col, alias)
+                if alias is not None:
+                    value_col = alias
+        grouped, _ = _aggregate_values(
             frame,
-            columns,
-            str(node.params["agg"]),
+            schema,
+            DAILY_KEY_COLUMNS,
+            agg,
             apply_to,
-            node.params.get("value_col"),
-            node.params.get("alias"),
+            value_col,
+            alias,
+            order_col="minute" if "minute" in schema.columns else None,
         )
-    return resample_frame(
-        frame,
-        columns,
-        frequency,
-        str(node.params["agg"]),
-        context,
-        apply_to=apply_to,
-        value_col=node.params.get("value_col"),
-        alias=node.params.get("alias"),
+        return grouped
+
+    interval = parse_minute_frequency(frequency)
+    if "minute" in schema.columns:
+        frame = frame.with_columns(pl.col("minute").alias("__order_minute"))
+    frame = _apply_auction(frame, auction, context, interval)
+    if interval == 1:
+        grouped, _ = _aggregate_values(
+            frame,
+            schema,
+            KEY_COLUMNS,
+            agg,
+            apply_to,
+            value_col,
+            alias,
+            order_col="__order_minute" if "minute" in schema.columns else None,
+        )
+        return grouped.sort(list(KEY_COLUMNS))
+
+    bucketed = _bucket_minutes(frame, interval, context)
+    grouped, _ = _aggregate_values(
+        bucketed,
+        schema,
+        KEY_COLUMNS,
+        agg,
+        apply_to,
+        value_col,
+        alias,
+        order_col="__order_minute",
     )
+    return grouped.sort(list(KEY_COLUMNS))
 
 
 @register_schema("aggregate")
 def _aggregate_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
+    parent = parent_schemas["input"]
     frequency = str(node.params["frequency"]).strip().lower()
-    parent_columns = list(parent_schemas["input"].columns)
-    apply_to = _normalize_apply_to(str(node.params.get("apply_to", APPLY_TO_FIELD)))
+    apply_to = str(node.params.get("apply_to", APPLY_TO_FIELD))
+    value_col = node.params.get("value_col")
+    alias = node.params.get("alias")
     if frequency in DAILY_FREQUENCIES:
-        value_col = _aggregate_value_col(parent_columns, node.params.get("value_col"), "Aggregate")
-        alias = str(node.params.get("alias") or value_col)
-        return FrameSchema((*DAILY_KEY_COLUMNS, alias))
-    if parse_minute_frequency(frequency) == 1:
-        return parent_schemas["input"]
-    return FrameSchema(
-        tuple(resample_columns(parent_columns, apply_to, node.params.get("value_col"), node.params.get("alias")))
-    )
+        keys = DAILY_KEY_COLUMNS
+        grain = "daily"
+    else:
+        parse_minute_frequency(frequency)
+        keys = KEY_COLUMNS
+        grain = "minute"
+    columns, fields = _aggregate_schema_parts(parent, keys, grain, apply_to, value_col, alias)
+    return FrameSchema(columns=columns, keys=keys, grain=grain, fields=fields)
 
 
-@register_executor("daily_agg")
-def _daily_agg(node: Node, context: EvalContext) -> pl.LazyFrame:
-    frame = context.evaluate(node.inputs["input"])
-    col = str(node.params["value_col"])
-    columns = list(context.infer_schema(node.inputs["input"]).columns)
-    return _daily_aggregate(
-        frame,
-        columns,
-        str(node.params["agg"]),
-        _normalize_apply_to(str(node.params.get("apply_to", APPLY_TO_FIELD))),
-        col,
-        "value",
-    )
-
-
-@register_schema("daily_agg")
-def _daily_agg_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
-    columns = parent_schemas["input"].columns
-    col = str(node.params["value_col"])
-    if col not in columns:
-        raise ValueError(f"DailyAgg value_col {col!r} is not available.")
-    return FrameSchema((*DAILY_KEY_COLUMNS, "value"))
-
-
-def aggregate_frame(
-    frame: pl.LazyFrame,
-    columns: list[str],
-    value_columns: list[str],
-    agg: str,
-    *,
-    group_keys: tuple[str, ...],
-    apply_to: str,
-    order_col: str | None = None,
-    keep_payload: bool,
-    aliases: dict[str, str] | None = None,
-) -> pl.LazyFrame:
-    """Aggregate public fields or their components to the requested key grain."""
-    apply_to = _normalize_apply_to(apply_to)
-    aliases = aliases or {}
-    payloads = ratio_payloads(value_columns, columns)
-    exprs: list[pl.Expr] = []
-    output_columns: list[str] = []
-    ratio_exprs: list[pl.Expr] = []
-    for column in value_columns:
-        output = aliases.get(column, column)
-        if apply_to == APPLY_TO_COMPONENTS and column in payloads:
-            numerator, denominator = payloads[column]
-            exprs.extend(
-                [
-                    _agg_expr(numerator, agg, order_col=order_col).alias(numerator),
-                    _agg_expr(denominator, agg, order_col=order_col).alias(denominator),
-                ]
-            )
-            ratio_exprs.append(_ratio_expr(numerator, denominator).alias(output))
-            output_columns.append(output)
-            if keep_payload:
-                output_columns.extend([numerator, denominator])
-        else:
-            exprs.append(_agg_expr(column, agg, order_col=order_col).alias(output))
-            output_columns.append(output)
-    grouped = frame.group_by(list(group_keys)).agg(exprs)
-    if ratio_exprs:
-        grouped = grouped.with_columns(ratio_exprs)
-    return grouped.select([*group_keys, *output_columns])
-
-
-def resample_frame(
-    frame: pl.LazyFrame,
-    columns: list[str],
-    frequency: str,
-    agg: str,
-    context: EvalContext,
-    *,
-    apply_to: str,
-    value_col: object | None = None,
-    alias: object | None = None,
-) -> pl.LazyFrame:
-    """Aggregate an intraday frame to a coarser minute frequency."""
-    interval = parse_minute_frequency(frequency)
-    if interval == 1:
-        return frame
-    value_columns = _selected_value_columns(columns, KEY_COLUMNS, value_col, "Aggregate")
-    if not value_columns:
-        raise ValueError("Resample input has no value columns to aggregate.")
-    if alias is not None and apply_to == APPLY_TO_COMPONENTS:
-        raise ValueError("Intraday component aggregation cannot rename output columns; project or aggregate by field first.")
-    if alias is not None and len(value_columns) != 1:
-        raise ValueError("Intraday aggregation alias requires exactly one value column.")
-    aliases = {value_columns[0]: str(alias)} if alias is not None and len(value_columns) == 1 else {}
-    pass_columns = aggregate_input_columns(columns, value_columns, apply_to)
-    bucket_map = context.minute_calendar.bucket_map(interval)
-    auctions = frame.filter(pl.col("minute").is_in(AUCTION_MINUTES)).select([*KEY_COLUMNS, *pass_columns])
-    continuous = frame.filter(~pl.col("minute").is_in(AUCTION_MINUTES)).select([*KEY_COLUMNS, *pass_columns])
-    bucketed = (
-        continuous.with_columns(pl.col("minute").alias("__order_minute"))
-        .join(bucket_map, on="minute", how="inner")
-        .with_columns(pl.col("__bucket_minute").alias("minute"))
-        .drop("__bucket_minute")
-    )
-    resampled = aggregate_frame(
-        bucketed,
-        columns,
-        value_columns,
-        agg,
-        group_keys=KEY_COLUMNS,
-        apply_to=apply_to,
-        order_col="__order_minute",
-        keep_payload=apply_to == APPLY_TO_COMPONENTS,
-        aliases=aliases,
-    )
-    return pl.concat([resampled, auctions], how="diagonal_relaxed").sort(list(KEY_COLUMNS))
-
-
-def aggregate_value_columns(columns: list[str], key_columns: tuple[str, ...]) -> list[str]:
-    """Return public value columns, excluding keys and internal component columns."""
-    return [column for column in columns if column not in key_columns and not column.startswith("__")]
+def aggregate_value_columns(schema: FrameSchema, value_col: object | None = None) -> list[str]:
+    """Return public value columns selected for aggregation."""
+    if value_col is not None:
+        col = str(value_col)
+        if col not in schema.columns:
+            raise ValueError(f"Aggregate value_col {col!r} is not available.")
+        return [col]
+    values = schema.value_columns()
+    if not values:
+        keys = set(schema.keys)
+        values = [column for column in schema.columns if column not in keys and not column.startswith("__")]
+    if not values:
+        raise ValueError("Aggregate input has no public value columns.")
+    return values
 
 
 def parse_minute_frequency(frequency: str) -> int:
-    """Parse strings like '1m', '5m', and '15m' into minute intervals."""
     text = frequency.strip().lower()
     if not text.endswith("m"):
-        raise ValueError("frequency must look like '1m', '5m', '15m', or 'daily'.")
+        raise ValueError("frequency must look like '1m', '5m', '15m', '1d', or 'daily'.")
     value = int(text[:-1])
     if value < 1:
         raise ValueError("frequency interval must be >= 1.")
     return value
 
 
-def aggregate_input_columns(columns: list[str], value_columns: list[str], apply_to: str) -> list[str]:
-    """Return physical columns needed to aggregate the requested public fields."""
-    if _normalize_apply_to(apply_to) == APPLY_TO_FIELD:
-        return value_columns
-    payloads = ratio_payloads(value_columns, columns)
-    return [*value_columns, *ratio_payload_columns(payloads)]
-
-
-def ratio_payloads(value_columns: list[str], columns: list[str]) -> dict[str, tuple[str, str]]:
-    """Return current ratio component payload columns keyed by public output column."""
-    column_set = set(columns)
-    payloads = {}
-    for column in value_columns:
-        numerator = f"__ratio_{column}_num"
-        denominator = f"__ratio_{column}_den"
-        if numerator in column_set and denominator in column_set:
-            payloads[column] = (numerator, denominator)
-    return payloads
-
-
-def ratio_payload_columns(payloads: dict[str, tuple[str, str]]) -> list[str]:
-    """Flatten ratio payload column pairs."""
-    columns = []
-    for numerator, denominator in payloads.values():
-        columns.extend([numerator, denominator])
-    return columns
-
-
-def _daily_aggregate(
+def _aggregate_values(
     frame: pl.LazyFrame,
-    columns: list[str],
+    schema: FrameSchema,
+    group_keys: tuple[str, ...],
     agg: str,
     apply_to: str,
-    value_col: object,
+    value_col: object | None,
     alias: object | None,
-) -> pl.LazyFrame:
-    value_col = _aggregate_value_col(columns, value_col, "Daily aggregate")
-    output = str(alias or value_col)
-    return aggregate_frame(
+    *,
+    order_col: str | None,
+) -> tuple[pl.LazyFrame, dict[str, FieldInfo]]:
+    value_columns = aggregate_value_columns(schema, value_col)
+    if alias is not None and len(value_columns) != 1:
+        raise ValueError("Aggregate alias requires exactly one value column.")
+    exprs: list[pl.Expr] = []
+    output_columns: list[str] = []
+    recompute: list[pl.Expr] = []
+    consumed_payloads: set[str] = set()
+    fields: dict[str, FieldInfo] = {}
+    for index, column in enumerate(value_columns):
+        info = _field_for_column(schema, column)
+        output = str(alias) if alias is not None else column
+        output_column = output
+        if apply_to == APPLY_TO_COMPONENTS and info.component_agg and info.components:
+            aggregated_components = tuple(f"__op_{output}_{idx}" for idx, _ in enumerate(info.components))
+            for component, out_component in zip(info.components, aggregated_components):
+                exprs.append(_agg_expr(component, agg, order_col).alias(out_component))
+                consumed_payloads.add(component)
+            recompute.append(_operator_expr(info.operator, aggregated_components).alias(output_column))
+            output_columns.append(output_column)
+            output_columns.extend(aggregated_components)
+            fields[output] = FieldInfo(
+                name=output,
+                column=output_column,
+                operator=info.operator,
+                components=aggregated_components,
+                source=info.source,
+                lookback_days=info.lookback_days,
+                component_agg=info.operator in ARITHMETIC_OPS,
+            )
+        else:
+            exprs.append(_agg_expr(column, agg, order_col).alias(output_column))
+            output_columns.append(output_column)
+            fields[output] = FieldInfo(
+                name=output,
+                column=output_column,
+                operator="identity",
+                source=info.source,
+                lookback_days=info.lookback_days,
+                component_agg=False,
+            )
+    for payload in _payload_columns(schema):
+        if payload in consumed_payloads or payload in output_columns:
+            continue
+        exprs.append(_agg_expr(payload, agg, order_col).alias(payload))
+        output_columns.append(payload)
+    grouped = frame.group_by(list(group_keys)).agg(exprs)
+    if recompute:
+        grouped = grouped.with_columns(recompute)
+    return grouped.select([*group_keys, *output_columns]), fields
+
+
+def _aggregate_schema_parts(
+    parent: FrameSchema,
+    keys: tuple[str, ...],
+    grain: str,
+    apply_to: str,
+    value_col: object | None,
+    alias: object | None,
+) -> tuple[tuple[str, ...], dict[str, FieldInfo]]:
+    values = aggregate_value_columns(parent, value_col)
+    if alias is not None and len(values) != 1:
+        raise ValueError("Aggregate alias requires exactly one value column.")
+    columns: list[str] = list(keys)
+    fields: dict[str, FieldInfo] = {}
+    for column in values:
+        info = _field_for_column(parent, column)
+        output = str(alias) if alias is not None else column
+        columns.append(output)
+        components: tuple[str, ...] = ()
+        operator = "identity"
+        component_agg = False
+        if apply_to == APPLY_TO_COMPONENTS and info.component_agg and info.components:
+            components = tuple(f"__op_{output}_{idx}" for idx, _ in enumerate(info.components))
+            columns.extend(components)
+            operator = info.operator
+            component_agg = True
+        fields[output] = FieldInfo(
+            name=output,
+            column=output,
+            operator=operator,
+            components=components,
+            source=info.source,
+            lookback_days=info.lookback_days,
+            component_agg=component_agg,
+        )
+    consumed_payloads = {
+        component
+        for column in values
+        for component in _field_for_column(parent, column).components
+        if apply_to == APPLY_TO_COMPONENTS and _field_for_column(parent, column).component_agg
+    }
+    columns.extend(payload for payload in _payload_columns(parent) if payload not in consumed_payloads)
+    return tuple(columns), fields
+
+
+def _apply_auction(frame: pl.LazyFrame, auction: str, context: EvalContext, interval: int) -> pl.LazyFrame:
+    if auction == "drop":
+        return frame.filter(~pl.col("minute").is_in(AUCTION_MINUTES))
+    if auction == "merge":
+        opening_auction, closing_auction = AUCTION_MINUTES
+        first_continuous, last_continuous = _auction_merge_targets(context, interval)
+        return frame.with_columns(
+            pl.when(pl.col("minute") == opening_auction)
+            .then(first_continuous)
+            .when(pl.col("minute") == closing_auction)
+            .then(last_continuous)
+            .otherwise(pl.col("minute"))
+            .alias("minute")
+        )
+    return frame
+
+
+def _auction_merge_targets(context: EvalContext, interval: int) -> tuple[int, int]:
+    continuous = [minute for minute in context.minute_calendar.minbars() if minute not in AUCTION_MINUTES]
+    if not continuous:
+        raise ValueError("Minute calendar must contain at least one non-auction minute for auction='merge'.")
+    if interval == 1:
+        return continuous[0], continuous[-1]
+    bucket_map = context.minute_calendar.bucket_map(interval).collect()
+    buckets = bucket_map["__bucket_minute"].to_list()
+    return int(buckets[0]), int(buckets[-1])
+
+
+def _merge_auction_frame(
+    frame: pl.LazyFrame,
+    schema: FrameSchema,
+    agg: str,
+    apply_to: str,
+    value_col: object | None,
+    alias: object | None,
+) -> tuple[pl.LazyFrame, FrameSchema]:
+    merged, fields = _aggregate_values(
         frame,
-        columns,
-        [value_col],
+        schema,
+        KEY_COLUMNS,
         agg,
-        group_keys=DAILY_KEY_COLUMNS,
-        apply_to=apply_to,
-        order_col="minute" if "minute" in columns else None,
-        keep_payload=False,
-        aliases={value_col: output},
+        apply_to,
+        value_col,
+        alias,
+        order_col="__order_minute",
+    )
+    return merged, FrameSchema(
+        columns=tuple(merged.collect_schema().names()),
+        keys=KEY_COLUMNS,
+        grain="minute",
+        fields=fields,
     )
 
 
-def resample_columns(
-    columns: list[str],
-    apply_to: str,
-    value_col: object | None,
-    alias: object | None,
-) -> list[str]:
-    """Return the output schema columns for an intraday aggregation."""
-    apply_to = _normalize_apply_to(apply_to)
-    value_columns = _selected_value_columns(columns, KEY_COLUMNS, value_col, "Aggregate")
-    if apply_to == APPLY_TO_FIELD:
-        if alias is not None:
-            if len(value_columns) != 1:
-                raise ValueError("Intraday aggregation alias requires exactly one value column.")
-            value_columns = [str(alias)]
-        return [*KEY_COLUMNS, *value_columns]
-    if alias is not None:
-        raise ValueError("Intraday component aggregation cannot rename output columns; project or aggregate by field first.")
-    payloads = ratio_payloads(value_columns, columns)
-    return [*KEY_COLUMNS, *value_columns, *ratio_payload_columns(payloads)]
+def _bucket_minutes(frame: pl.LazyFrame, interval: int, context: EvalContext) -> pl.LazyFrame:
+    auctions = frame.filter(pl.col("minute").is_in(AUCTION_MINUTES))
+    continuous = frame.filter(~pl.col("minute").is_in(AUCTION_MINUTES))
+    bucketed = (
+        continuous.join(context.minute_calendar.bucket_map(interval), on="minute", how="inner")
+        .with_columns(pl.col("__bucket_minute").alias("minute"))
+        .drop("__bucket_minute")
+    )
+    return pl.concat([bucketed, auctions], how="diagonal_relaxed")
 
 
-def _selected_value_columns(
-    columns: list[str],
-    key_columns: tuple[str, ...],
-    value_col: object | None,
-    subject: str,
-) -> list[str]:
-    if value_col is not None:
-        col = str(value_col)
-        if col not in columns:
-            raise ValueError(f"{subject} value_col {col!r} is not available.")
-        return [col]
-    return aggregate_value_columns(columns, key_columns)
-
-
-def _aggregate_value_col(columns: list[str] | tuple[str, ...], value_col: object, subject: str) -> str:
-    if value_col is not None:
-        col = str(value_col)
-        if col not in columns:
-            raise ValueError(f"{subject} value_col {col!r} is not available.")
-        return col
-    values = aggregate_value_columns(list(columns), KEY_COLUMNS)
-    if len(values) != 1:
-        raise ValueError(f"{subject} requires exactly one value column when value_col is omitted, got {values}.")
-    return values[0]
-
-
-def _normalize_apply_to(value: str) -> str:
-    value = value.strip().lower()
-    if value not in {APPLY_TO_COMPONENTS, APPLY_TO_FIELD}:
-        raise ValueError("apply_to must be 'components' or 'field'.")
-    return value
-
-
-def _agg_expr(column: str | pl.Expr, method: str, *, order_col: str | None = None) -> pl.Expr:
+def _agg_expr(column: str, method: str, order_col: str | None) -> pl.Expr:
     method = method.lower()
-    expr = pl.col(column) if isinstance(column, str) else column
+    expr = pl.col(column)
     if order_col is not None and method in {"first", "last"}:
         expr = expr.sort_by(order_col)
     if method == "sum":
@@ -365,5 +351,32 @@ def _agg_expr(column: str | pl.Expr, method: str, *, order_col: str | None = Non
     raise ValueError(f"Unsupported aggregation {method!r}.")
 
 
-def _ratio_expr(numerator: str, denominator: str) -> pl.Expr:
-    return pl.when(pl.col(denominator) == 0).then(None).otherwise(pl.col(numerator) / pl.col(denominator))
+def _operator_expr(operator: str, components: tuple[str, ...]) -> pl.Expr:
+    if len(components) != 2:
+        raise ValueError(f"Component aggregation for {operator!r} requires two components.")
+    left = pl.col(components[0])
+    right = pl.col(components[1])
+    if operator == "add":
+        return left + right
+    if operator == "sub":
+        return left - right
+    if operator == "mul":
+        return left * right
+    if operator == "div":
+        return pl.when(right == 0).then(None).otherwise(left / right)
+    raise ValueError(f"Unsupported component aggregation operator {operator!r}.")
+
+
+def _field_for_column(schema: FrameSchema, column: str) -> FieldInfo:
+    for info in schema.fields.values():
+        if info.column == column:
+            return info
+    return FieldInfo(name=column, column=column)
+
+
+def _payload_columns(schema: FrameSchema) -> list[str]:
+    return [
+        column
+        for column in schema.columns
+        if column not in schema.keys and column.startswith("__")
+    ]

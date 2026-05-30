@@ -1,76 +1,112 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import replace
+
 import polars as pl
 
 from draco_model.core import Layer, Node
+from draco_model.layers.names import validate_public_alias
 from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
-from draco_model.runtime.execution import EvalContext, FrameSchema, register_executor, register_schema
+from draco_model.runtime.execution import EvalContext, FieldInfo, FrameSchema, register_executor, register_schema
 
 
-class Concat(Layer):
-    """Horizontally align multiple frames by their key columns."""
+class Join(Layer):
+    """Horizontally align multiple frames by key columns."""
 
-    op = "concat"
+    op = "join"
+
+    def __call__(self, inputs: Node | Mapping[str, Node]) -> Node:
+        if isinstance(inputs, Mapping):
+            for input_name in inputs:
+                validate_public_alias(input_name, subject="Join input name")
+        return super().__call__(inputs)
 
 
-@register_executor("concat")
-def _concat(node: Node, context: EvalContext) -> pl.LazyFrame:
+class Project(Layer):
+    """Keep only key columns and public fields."""
+
+    op = "project"
+
+
+@register_executor("join")
+def _join(node: Node, context: EvalContext) -> pl.LazyFrame:
     intraday_frames = []
     daily_frames = []
     for input_name, parent in node.inputs.items():
+        schema = context.infer_schema(parent)
         frame = context.evaluate(parent)
-        columns = list(context.infer_schema(parent).columns)
-        keys = _key_columns(columns)
-        values = _value_columns(columns)
-        renames = _concat_renames(input_name, values)
-        renamed = frame.rename(renames).select([*keys, *renames.values()])
-        if keys == list(KEY_COLUMNS):
-            intraday_frames.append(renamed)
-        elif keys == list(DAILY_KEY_COLUMNS):
-            daily_frames.append(renamed)
-
+        renames = _renames(input_name, schema)
+        selected = frame.rename(renames).select([*schema.keys, *renames.values()])
+        if schema.keys == KEY_COLUMNS:
+            intraday_frames.append(selected)
+        elif schema.keys == DAILY_KEY_COLUMNS:
+            daily_frames.append(selected)
+        else:
+            raise ValueError(f"Join input {input_name!r} does not have recognized keys.")
     if intraday_frames:
         out = pl.concat(intraday_frames, how="align")
-        for daily_frame in daily_frames:
-            out = out.join(daily_frame, on=list(DAILY_KEY_COLUMNS), how="left")
+        for daily in daily_frames:
+            out = out.join(daily, on=list(DAILY_KEY_COLUMNS), how="left")
         return out
     return pl.concat(daily_frames, how="align")
 
 
-@register_schema("concat")
-def _concat_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
-    intraday_values: list[str] = []
-    daily_values: list[str] = []
+@register_schema("join")
+def _join_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
+    has_intraday = any(schema.keys == KEY_COLUMNS for schema in parent_schemas.values())
+    keys = KEY_COLUMNS if has_intraday else DAILY_KEY_COLUMNS
+    columns = list(keys)
+    fields: dict[str, FieldInfo] = {}
     for input_name, schema in parent_schemas.items():
-        columns = list(schema.columns)
-        keys = _key_columns(columns)
-        values = list(_concat_renames(input_name, _value_columns(columns)).values())
-        if keys == list(KEY_COLUMNS):
-            intraday_values.extend(values)
-        elif keys == list(DAILY_KEY_COLUMNS):
-            daily_values.extend(values)
-    if intraday_values:
-        return FrameSchema((*KEY_COLUMNS, *intraday_values, *daily_values))
-    return FrameSchema((*DAILY_KEY_COLUMNS, *daily_values))
+        renames = _renames(input_name, schema)
+        columns.extend(renames.values())
+        for field_name, info in schema.fields.items():
+            output_name = renames.get(info.column, field_name)
+            component_renames = tuple(renames.get(component, component) for component in info.components)
+            fields[output_name] = replace(
+                info,
+                name=output_name,
+                column=output_name,
+                components=component_renames,
+            )
+    return FrameSchema(columns=tuple(dict.fromkeys(columns)), keys=keys, grain="minute" if has_intraday else "daily", fields=fields)
 
 
-def _value_columns(columns: list[str]) -> list[str]:
-    keys = set(_key_columns(columns))
-    return [column for column in columns if column not in keys and not column.startswith("__")]
+@register_executor("project")
+def _project(node: Node, context: EvalContext) -> pl.LazyFrame:
+    parent = node.inputs["input"]
+    schema = context.infer_schema(parent)
+    return context.evaluate(parent).select([*schema.keys, *schema.value_columns()])
 
 
-def _key_columns(columns: list[str]) -> list[str]:
-    if list(columns[:3]) == list(KEY_COLUMNS) or all(column in columns for column in KEY_COLUMNS):
-        return list(KEY_COLUMNS)
-    if list(columns[:2]) == list(DAILY_KEY_COLUMNS) or all(column in columns for column in DAILY_KEY_COLUMNS):
-        return list(DAILY_KEY_COLUMNS)
-    raise ValueError(f"Frame does not contain recognized key columns: {columns}.")
+@register_schema("project")
+def _project_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
+    parent = parent_schemas["input"]
+    fields = {
+        name: replace(info, components=(), component_agg=False)
+        for name, info in parent.fields.items()
+    }
+    return FrameSchema(
+        columns=(*parent.keys, *[info.column for info in fields.values()]),
+        keys=parent.keys,
+        grain=parent.grain,
+        fields=fields,
+    )
 
 
-def _concat_renames(input_name: str, values: list[str]) -> dict[str, str]:
-    if len(values) == 1:
-        target = input_name
-        if target in KEY_COLUMNS or target in DAILY_KEY_COLUMNS:
-            raise ValueError(f"Concat input name {input_name!r} conflicts with key columns.")
-        return {values[0]: target}
-    return {column: f"{input_name}__{column}" for column in values}
+def _renames(input_name: str, schema: FrameSchema) -> dict[str, str]:
+    validate_public_alias(input_name, subject="Join input name")
+    values = [column for column in schema.columns if column not in schema.keys]
+    public = set(schema.value_columns())
+    out: dict[str, str] = {}
+    for column in values:
+        if column in public:
+            target = input_name if len(public) == 1 else f"{input_name}__{column}"
+            if target in KEY_COLUMNS or target in DAILY_KEY_COLUMNS:
+                raise ValueError(f"Join input name {input_name!r} conflicts with key columns.")
+            out[column] = target
+        else:
+            clean = column.lstrip("_")
+            out[column] = f"__{input_name}_{clean}"
+    return out

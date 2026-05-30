@@ -1,80 +1,82 @@
-﻿# Draco Model
+# Draco Model
 
-`draco-model` 是一个基于 Polars 的因子计算图原型。用户用 callable layer 构建静态 DAG，然后交给 `Engine` 执行。
+`draco-model` 是一个基于 Polars LazyFrame 的因子 DAG 原型。当前版本已经切到新的 General Operator DAG：字段不再是黑盒 `Field` executor，而是展开成可 trace 的 `Source -> Where -> Op -> Aggregate -> Join/Project` 图。
 
 ```python
 from draco_model import Engine, Model
-from draco_model.layers import Auction, DailyAgg, Field, Input
+from draco_model.layers import Aggregate, Metric, Source
 
-close = Auction("drop")(
-    Field("close")(
-        Input(source="trades_tbar")
-    )
-)
-output = DailyAgg(value_col="close", agg="last")(close)
+raw = Source("trades_tbar")
+close = Metric("close", raw)
+output = Aggregate("1d", "last", value_col="close", alias="value")(close)
 
 model = Model(name="close_last", universe="ex2kamt", output=output)
 df = Engine(data_root="data").collect(model, dates=["20170103"])
 ```
 
-## 核心概念
+## 核心 API
 
-- `Input(source=...)` 扫描一个 raw source，覆盖请求的交易日。它不构造 value field，也不会自动补 intraday grid。
-- `Field("name", alias=None)` 从 raw source frame 中构造一个 value column。用 `alias` 可以避免同名字段冲突，例如 `Field("volume", alias="trade_volume")`。`alias` 不能以 `__` 开头，这个前缀保留给内部 payload。
-- `RatioField("amount", "volume", alias="vwap")` 构造 ratio 类字段。它保留内部 numerator/denominator payload，后续聚合层可以选择聚合 payload 后再相除，或直接聚合合成后的 public field。`alias` 同样不能以 `__` 开头。
-- `Auction("drop")` 删除 auction minutes。`Auction("merge", agg="sum")` 把 `925 -> 930`、`1456 -> 1500` 后聚合，`agg` 支持 `first`、`last`、`sum`。默认 `apply_to="components"`，ratio 字段会先聚合 numerator/denominator，再重新相除；也可以用 `apply_to="field"` 直接聚合 public field。
-- `Resample("5m", "last")` 用显式 aggregation 做分钟重采样，例如 `first`、`last`、`max`、`min`、`sum`、`mean`。`sum` 对全 null group 保持 null，不会把缺失误写成 0。默认 `apply_to="components"`，ratio 字段会先聚合 numerator/denominator，再重新相除；`apply_to="field"` 则直接聚合合成后的 public field，并丢弃内部 payload。
-- `Aggregate(frequency, agg, ...)` 是统一的聚合入口，`frequency` 可以是分钟频率如 `"5m"`，也可以是 `"daily"` / `"1d"`。它支持 `value_col`、`alias` 和 `apply_to="field" | "components"`；默认 `apply_to="field"`，适合把已经形成的 public field 聚合成新字段。
-- `Concat()` 横向合并 frame。混合 intraday 和 daily frame 时，会先用 `pl.concat(..., how="align")` 对齐所有 intraday frame，再把 daily frame 按 `(date, secu_code)` left join 上去。
-- `Fill(value)` 填充单 value column 的 null。`Fill(0)` / `Fill(1.5)` 用固定数值填充；`Fill("ffill")` 在每个 `(date, secu_code)` 内 forward fill；`Fill("state")` 用 close_state 填充 price field 的 null。`close` 会先在每个 `(secu_code, date)` 内 forward fill，再用 `daily_k.preclose` 填剩余 null；`open/high/low` 和 ratio 字段用同链路的 close_state 填 null；如果链路包含 `Auction("merge")` 或 `Resample`，close_state 中的 close 聚合固定使用 `last`；`preclose` 使用上一根 close_state。`Fill("state")` 会把 close_state 作为显式 DAG input 构造出来，所以 trace 和 Mermaid 可以看到这条依赖。
-- `DailyAgg(value_col=..., agg=...)` 把 intraday frame 聚合成日频 factor value。默认 `apply_to="field"`；如果输入是 ratio 字段，并且希望先聚合 numerator/denominator 再相除，可以显式写 `apply_to="components"`。`sum` 对全 null group 保持 null。
-- `Node` / `Layer` 支持可选 `name`。不传时系统会按拓扑顺序生成简洁稳定的 resolved name，例如 `input_0`、`field_0`、`resample_0`；`name` 只用于 trace 和 Mermaid，不改变计算语义，也不参与结构性 `Node.id`。
-- `Model.explain_mermaid()` 输出 Mermaid DAG，使用和 trace 一致的 resolved name，方便检查模型结构。
-- `Engine.trace(model, date)` 按图顺序 materialize 每个 frame node，返回的 `TraceStep.resolved_name` 可直接和 Mermaid 图对应。
+- `Source("trades_tbar")` 扫描一个 raw source，不自动补 intraday grid。
+- `Metric("name", raw)` 是字段 recipe shorthand；它会展开成真实 DAG。
+- `Col("price")` 是 raw column reference，只能应用到 frame 上，例如 `(Col("price") * Col("volume")).alias("amount")(raw)`。
+- `Op("name", ...)` 是统一 operator 入口，支持 `add/sub/mul/div/rolling_corr/rolling_beta/rolling_alpha`。
+- `Node` 和 `Col` 支持 magic arithmetic：`+ - * /` 都会生成 `op` 节点。
+- `Where(Side("buy"))` / `Where(Side("sell"))` 是语义 side filter；执行时映射到当前数据中的 `side == 0/1`。
+- `Aggregate(frequency, agg, ...)` 统一处理 raw -> 1m、分钟 resample、daily agg 和 auction 逻辑。
+- `Join()` 横向合并多个 frame，保留 public fields 和 internal payload。
+- `Project()` 显式丢弃 internal payload，只保留 key columns + public fields。
+- `FillNull(value)` 支持固定数值、`"ffill"` 和 `"state"`；`"state"` 使用 close_state 填 public field。
 
-## Field Builders
+除非显式运行 `Project()`，其他 layer 都会保留 internal payload。聚合类 layer 会把 payload 聚合到目标粒度；`FillNull()` 会保留 payload 列，但填充后的 public field 不再把旧 payload 标记为可重算 components。
+Public alias 和 `Join()` input name 不能以 `__` 开头，也不能使用 `date`、`secu_code`、`minute` 这些 key column 名。
 
-内置 field builder 按 field name 注册：
+旧 public API 已删除：`Field`、`RatioField`、`Auction`、`Resample`、`DailyAgg`、`Concat` 不再导出。
 
-- `close`：在 `date`、`secu_code`、`minute` 粒度下，取 `is_last=True` 的 `price`。
-- `open`：在 `date`、`secu_code`、`minute` 粒度下，取 `is_first=True` 的 `price`。
-- `high`：每个 minute key 的 `price` 最大值。
-- `low`：每个 minute key 的 `price` 最小值。
-- `volume`：每个 minute key 的 `volume` 加总；如果该 group 全是 null，结果保持 null。
-- `no`：每个 minute key 的 `no` 加总；如果该 group 全是 null，结果保持 null。`no` 表示 records 数量，不表示价格顺序。
-- `amount`：如果 raw source 有 `amount`，按 minute key 加总；否则使用 `sum(price * volume)` 推导；如果该 group 全是 null，结果保持 null。
-- `preclose`：不能直接作为普通 `Field` evaluate；单独写 `Field("preclose")(Input(...))` 会 raise `ValueError`。必须通过 `Fill("state")(Field("preclose")(...))` 使用，由上一根 close_state 推导，第一根用 `daily_k.preclose`。
+## Metric Recipes
 
-每个 `Field` builder 应返回 key columns 加一个 public value column。内部 helper column 不应暴露出去。
+内置 `Metric` 语义：
 
-`vwap` 这类 ratio 字段不再写成 `Field("vwap")`，而是：
+- `Metric("volume", raw)`：`Col("volume") -> Aggregate("1m", "sum")`。
+- `Metric("no", raw)`：`Col("no") -> Aggregate("1m", "sum")`。`no` 表示 records 数量，不表示价格顺序。
+- `Metric("amount", raw)`：`Col("price") * Col("volume") -> Aggregate("1m", "sum")`。即使 raw source 有 `amount` 列，也固定使用 `price * volume`。
+- `Metric("buyamount", raw)`：`Where(Side("buy")) -> price * volume -> Aggregate("1m", "sum")`。
+- `Metric("sellamount", raw)`：`Where(Side("sell")) -> price * volume -> Aggregate("1m", "sum")`。
+- `Metric("vwap", raw)`：`Metric("amount", raw) / Metric("volume", raw)`。
+- `Metric("open/close")`：分别用 `is_first` / `is_last` 过滤 price 后聚合。
+- `Metric("high/low")`：对 price 做 max/min。
+- `Metric("preclose")`：直接 evaluate 会报错；必须通过 `FillNull("state")(Metric("preclose", raw))` 使用。
 
-```python
-from draco_model.layers import Auction, Input, RatioField, Resample
-
-raw = Input(source="trades_tbar")
-vwap = Resample("5m", "sum")(
-    Auction("merge", agg="sum")(
-        RatioField("amount", "volume", alias="vwap")(raw)
-    )
-)
-```
-
-ratio 字段聚合时有两种语义：
+示例：
 
 ```python
-from draco_model.layers import Aggregate, DailyAgg, Input, RatioField, Resample
+from draco_model.layers import Aggregate, Col, FillNull, Metric, Source
 
-raw_vwap = RatioField("amount", "volume", alias="vwap")(Input(source="trades_tbar"))
+raw = Source("trades_tbar")
 
-# 先 sum amount 和 volume，再相除，适合 VWAP 这类 ratio 指标。
-vwap_5m = Resample("5m", "sum", apply_to="components")(raw_vwap)
-daily_vwap = DailyAgg(value_col="vwap", agg="sum", apply_to="components")(raw_vwap)
+amount = Metric("amount", raw)
+volume = Metric("volume", raw)
+vwap = (amount / volume).alias("vwap")
 
-# 先算每分钟 vwap，再对 public field 做 mean。
-mean_minute_vwap_5m = Resample("5m", "mean", apply_to="field")(raw_vwap)
-daily_mean_minute_vwap = Aggregate("daily", "mean", value_col="vwap", alias="value")(raw_vwap)
+vwap_5m = Aggregate("5m", "sum", apply_to="components")(vwap)
+mean_minute_vwap = Aggregate("5m", "mean", apply_to="field")(vwap)
+
+row_amount = (Col("price") * Col("volume")).alias("amount")(raw)
+preclose = FillNull("state")(Metric("preclose", raw))
 ```
+
+## Aggregate 语义
+
+`Aggregate(frequency, agg, value_col=None, alias=None, apply_to="field", auction="keep")`：
+
+- `frequency="1m"`：按 `(date, secu_code, minute)` 聚合 raw bucket。
+- `frequency="5m"`：按 minute calendar 重采样，auction bars 默认保留。
+- `frequency="1d"` / `"daily"`：按 `(date, secu_code)` 聚合。
+- `auction="drop"` 删除 auction minutes。
+- `auction="merge"` 先把 auction minutes 合入当前目标频率中除 auction 外的第一根/最后一根 bar，再执行聚合；例如 1m 为 `925 -> 930`、`1500 -> 1456`，5m 为 `925 -> 930`、`1500 -> 1455`。Daily aggregate 也会先应用 `auction` 策略，再按日聚合。
+- `apply_to="field"` 直接聚合 public output，同时保留 payload。
+- `apply_to="components"` 对 operator components 分别聚合，再按原 operator 重算 public output。
+
+`sum` 使用 null-safe sum：如果一个 group 全是 null，结果保持 null，不会被 Polars 默认 sum 写成 0。
 
 ## 数据目录
 
@@ -109,41 +111,25 @@ source 语义：
 - `universe/ex2kamt` 定义股票池，并包含一些日频参考字段。
 - `external/trading_days.parquet` 是交易日历来源。
 
-source scan 会标准化常见 vendor column name，例如 `SecuCode -> secu_code`、`MinBar -> minute`、`Price -> price`、`Amount -> amount`、`Volume -> volume`、`No -> no`、`isfirst -> is_first`、`islast -> is_last`、`trading_day -> date`。
+source scan 会标准化常见 vendor column name，例如 `SecuCode -> secu_code`、`MinBar -> minute`、`Price -> price`、`Amount -> amount`、`Volume -> volume`、`No -> no`、`Side -> side`、`isfirst -> is_first`、`islast -> is_last`、`trading_day -> date`。
 
-## 组合字段
+## Trace 和 Mermaid
 
-当两个 source 产出同名字段时，可以用 `alias` 或 named `Concat` input 避免列名冲突：
-
-```python
-from draco_model.layers import Concat, Field, Input
-
-trade_volume = Field("volume", alias="trade_volume")(Input(source="trades_tbar"))
-cancel_volume = Field("volume", alias="cancel_volume")(Input(source="cancels_tbar"))
-
-features = Concat()({
-    "trade_volume": trade_volume,
-    "cancel_volume": cancel_volume,
-})
-```
-
-`alias` 必须是 public column name，不能以 `__` 开头；`__` 前缀由系统内部 payload 使用，例如 ratio 字段的 numerator/denominator。
+`Engine.trace(model, date)` 会按拓扑顺序 materialize 每个 frame node；`Model.explain_mermaid()` 会输出同一张 DAG。因为 metric 会展开，`amount`、`buyamount`、`vwap` 这类字段的内部 `where/op/aggregate` 都能在 trace 和图里看到。
 
 ## 运行示例
 
-在项目根目录执行：
-
 ```powershell
 python -m examples.close_last
+python -m examples.top_volume_close_mean
+python -m examples.preclose_fill_state_demo
 ```
-
-示例会打印 factor result 和 Mermaid DAG。实际运行需要按上面的目录准备本地 parquet 数据。
 
 ## TODO
 
-- v1 的 field builder 只按 field name 注册，不按 `(source, field)` 注册。如果未来同名 field 在不同 source 上需要不同语义，再在 v2 里设计 source-aware field registry。
-- Source 层需要主动提供 normalized schema columns，例如 `SourceCatalog.schema(source, dates)`，让上层 schema inference 不必通过扫描得到的 LazyFrame 反复 `collect_schema()`。
-- 思考 `close_state` 是否也应该进入 payload 体系：目前它是 `Fill("state")` 内部临时状态，后续可以考虑把它作为一种可传递 payload，让 transform / fill 的状态依赖更统一。
-- 评估扩展 `Node.kind`：当前主要有 `frame` 和 `condition`，未来可考虑加入 `expression`（列级表达式）、`scalar`（横截面/全局统计值）和 `meta`（calendar、universe、schema、lineage 等 planner 元信息）节点；这是长期架构方向，当前不急做。
-- 增加多 model 的 batch planner：一次接收多个 `Model`，合并可复用的 source scan / field / transform 中间节点，按共享 DAG 执行，最后再拆回每个 model 的结果。
-
+- Source 层需要主动提供 normalized schema columns，例如 `SourceCatalog.schema(source, dates)`，减少上层 schema inference 对 `collect_schema()` 的依赖。
+- 后续 batch planner 需要合并多个 model / metric 中可复用的 source scan、operator branch 和 join。
+- 后续 optimizer 可以把同 source 的 `Metric("amount")`、`Metric("volume")`、`Metric("vwap")` fuse 成更少的 physical plan。
+- 继续思考 `close_state` 是否也进入 payload / operator metadata 体系。
+- 设计 `FillNull()` 后再次 `Aggregate()` 的 payload 语义：当前 `FillNull()` 会保留 payload，但不会把旧 components 标记为可重算；后续需要决定 filled public field 与 payload/components 的一致性策略。
+- 设计 `apply_to="field"` 后保留 payload 的二次聚合语义：当前 payload 会随 field aggregation 保留，但不保证可重算 public field；后续需要明确它是 lineage/debug，还是可参与后续计算的状态。

@@ -21,18 +21,26 @@ def _register_condition(op: str) -> Callable[[ConditionExpression], ConditionExp
     return decorator
 
 
-def _condition_expr(node: Node) -> pl.Expr:
-    try:
-        return _CONDITIONS[node.op](node)
-    except KeyError:
-        raise ValueError(f"Unsupported condition {node.op!r}.") from None
+class Side(Condition):
+    """Semantic side condition."""
+
+    def __init__(self, side: str) -> None:
+        if side not in {"buy", "sell"}:
+            raise ValueError("Side must be 'buy' or 'sell'.")
+        super().__init__("side", {"side": side})
+
+
+class Flag(Condition):
+    """Boolean column condition, used by metric recipes."""
+
+    def __init__(self, column: str) -> None:
+        super().__init__("flag", {"column": column})
 
 
 class Threshold(Condition):
     """Compare one column with a literal threshold value."""
 
     def __init__(self, column: str, *, op: str = ">", value: Any) -> None:
-        """Create a column comparison condition."""
         if op not in {">", ">=", "<", "<=", "==", "=", "!=", "<>"}:
             raise ValueError("Unsupported threshold op.")
         super().__init__("threshold", {"column": column, "op": op, "value": value})
@@ -42,43 +50,56 @@ class TopQuantile(Condition):
     """Keep rows whose column value is at or above a group quantile."""
 
     def __init__(self, column: str, *, q: float, over: list[str] | tuple[str, ...]) -> None:
-        """Create a quantile condition grouped by the over columns."""
         if not 0 <= q <= 1:
             raise ValueError("q must be in [0, 1].")
         super().__init__("top_quantile", {"column": column, "q": float(q), "over": list(over)})
 
 
-class Filter(Layer):
+class Where(Layer):
     """Filter a frame with a condition node."""
 
-    op = "filter"
+    op = "where"
 
     def __init__(self, condition: Condition, *, name: str | None = None) -> None:
-        """Store the condition to attach when the layer is called."""
         super().__init__(name=name)
         self.condition = condition
 
     def __call__(self, frame: Node) -> Node:
-        """Build a filter node with both frame and condition dependencies."""
-        condition_node = self.condition.to_node(frame)
         return Node(
             kind="frame",
             op=self.op,
-            inputs={"frame": frame, "condition": condition_node},
+            inputs={"frame": frame, "condition": self.condition.to_node(frame)},
             name=self.name,
         )
 
 
-@register_executor("filter")
-def _filter(node: Node, context: EvalContext) -> pl.LazyFrame:
-    frame = context.evaluate(node.inputs["frame"])
-    condition = node.inputs["condition"]
-    return frame.filter(_condition_expr(condition))
+@register_executor("where")
+def _where(node: Node, context: EvalContext) -> pl.LazyFrame:
+    return context.evaluate(node.inputs["frame"]).filter(_condition_expr(node.inputs["condition"]))
 
 
-@register_schema("filter")
-def _filter_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
+@register_schema("where")
+def _where_schema(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FrameSchema:
     return parent_schemas["frame"]
+
+
+def _condition_expr(node: Node) -> pl.Expr:
+    try:
+        return _CONDITIONS[node.op](node)
+    except KeyError:
+        raise ValueError(f"Unsupported condition {node.op!r}.") from None
+
+
+@_register_condition("side")
+def _side_expr(node: Node) -> pl.Expr:
+    side = str(node.params["side"])
+    code = {"buy": 0, "sell": 1}[side]
+    return pl.col("side") == code
+
+
+@_register_condition("flag")
+def _flag_expr(node: Node) -> pl.Expr:
+    return pl.col(str(node.params["column"])).fill_null(False)
 
 
 @_register_condition("threshold")
