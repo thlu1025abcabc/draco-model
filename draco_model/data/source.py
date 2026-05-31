@@ -24,7 +24,7 @@ class SourceCatalog:
         return pl.concat(frames, how="diagonal_relaxed")
 
     def schema(self, source: str, dates: list[str]) -> tuple[str, ...]:
-        """Return normalized source columns, using fixed source contracts when known."""
+        """Return normalized source columns, using fixed contracts without scanning known sources."""
         if not dates:
             raise ValueError("Source schema requires at least one date.")
         if source in _FIXED_SOURCE_SCHEMAS:
@@ -40,9 +40,22 @@ class SourceCatalog:
             raise FileNotFoundError(f"Missing source file: {path}")
         frame = pl.scan_parquet(path)
         frame = _standardize_columns(frame, date)
+        self._validate_fixed_schema(frame, source, date)
         self._validate_minutes(frame, source, date)
         self._scans[key] = frame
         return frame
+
+    def _validate_fixed_schema(self, frame: pl.LazyFrame, source: str, date: str) -> None:
+        fixed = _FIXED_SOURCE_SCHEMAS.get(source)
+        if fixed is None:
+            return
+        actual = tuple(frame.collect_schema().names())
+        missing = [column for column in fixed if column not in actual]
+        if missing:
+            raise ValueError(
+                f"Source {source!r} date {date} is missing fixed schema columns: {missing}. "
+                f"Actual normalized columns: {list(actual)}."
+            )
 
     def _validate_minutes(self, frame: pl.LazyFrame, source: str, date: str) -> None:
         schema = frame.collect_schema()

@@ -5,7 +5,10 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from draco_model.data.source import SourceCatalog
+from draco_model import Engine, Model
+from draco_model.data.source import SourceCatalog, _FIXED_SOURCE_SCHEMAS, _standardize_columns
+from draco_model.layers import Source
+from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
 
 
 def test_fixed_source_schema_does_not_scan_files(tmp_path: Path) -> None:
@@ -84,6 +87,55 @@ def test_fixed_source_schema_does_not_scan_files(tmp_path: Path) -> None:
     assert catalog._scans == {}
 
 
+def test_fixed_source_schemas_match_standardized_representative_columns() -> None:
+    for source, fixed_schema in _FIXED_SOURCE_SCHEMAS.items():
+        actual = _standardize_columns(_representative_source_frame(source).lazy(), "20170103").collect_schema().names()
+        missing = [column for column in fixed_schema if column not in actual]
+        assert missing == [], f"{source} fixed schema missing from standardized columns: {missing}"
+
+
+def test_fixed_source_missing_column_raises_clear_error(tmp_path: Path) -> None:
+    _write_trading_days(tmp_path)
+    path = tmp_path / "data" / "trades_tbar" / "20170103.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        {
+            "SecuCode": [1],
+            "MinBar": [930],
+            "Price": [10.0],
+            "Side": [0],
+            "Volume": [1.0],
+            "isfirst": [True],
+            "islast": [True],
+            "No": [1],
+        }
+    ).write_parquet(path)
+    raw = Source("trades_tbar")
+
+    with pytest.raises(ValueError, match="missing fixed schema columns.*vw_wait_time"):
+        Engine(data_root=tmp_path / "data").evaluate(Model("bad_source", "ex2kamt", raw), raw, "20170103").collect()
+
+
+def test_fixed_source_plans_have_expected_keys_and_grain(tmp_path: Path) -> None:
+    _write_trading_days(tmp_path)
+    engine = Engine(data_root=tmp_path / "data")
+    engine._ensure_calendar()
+    expected = {
+        "trades_tbar": (KEY_COLUMNS, "raw"),
+        "cancels_tbar": (KEY_COLUMNS, "raw"),
+        "quotes_tbar": (KEY_COLUMNS, "raw"),
+        "snapshot_tbar": (KEY_COLUMNS, "raw"),
+        "daily_k": (DAILY_KEY_COLUMNS, "daily"),
+        "universe/ex2kamt": (DAILY_KEY_COLUMNS, "daily"),
+    }
+
+    for source, (keys, grain) in expected.items():
+        node = Source(source)
+        schema = engine._infer_schema(Model(f"schema_{source.replace('/', '_')}", "ex2kamt", node), node, "20170103")
+        assert schema.keys == keys
+        assert schema.grain == grain
+
+
 def test_unknown_source_schema_falls_back_to_scan(tmp_path: Path) -> None:
     path = tmp_path / "foo" / "20170103.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -138,3 +190,84 @@ def test_validate_minutes_runs_once_per_source_date(
 
     assert calls == [("foo", "20170103"), ("foo", "20170104")]
     assert set(catalog._scans.keys()) == {("foo", "20170103"), ("foo", "20170104")}
+
+
+def _write_trading_days(tmp_path: Path) -> None:
+    path = tmp_path / "external" / "trading_days.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"date": ["20170103"]}).write_parquet(path)
+
+
+def _representative_source_frame(source: str) -> pl.DataFrame:
+    if source in {"trades_tbar", "cancels_tbar"}:
+        return pl.DataFrame(
+            {
+                "SecuCode": [1],
+                "MinBar": [930],
+                "Price": [10.0],
+                "Side": [0],
+                "Volume": [1.0],
+                "vw_wait_time": [0.0],
+                "isfirst": [True],
+                "islast": [True],
+                "No": [1],
+            }
+        )
+    if source == "quotes_tbar":
+        return pl.DataFrame(
+            {
+                "SecuCode": [1],
+                "MinBar": [930],
+                "Price": [10.0],
+                "Side": [0],
+                "Volume": [1.0],
+                "isfirst": [True],
+                "islast": [True],
+                "No": [1],
+            }
+        )
+    if source == "daily_k":
+        return pl.DataFrame(
+            {
+                "sec_code": ["000001.SZ"],
+                "trading_day": ["2017-01-03"],
+                "open": [10.0],
+                "high": [11.0],
+                "low": [9.0],
+                "close": [10.5],
+                "shares": [100.0],
+                "amount": [1000.0],
+                "limit_up": [11.0],
+                "limit_down": [9.0],
+                "preclose": [9.5],
+                "isSuspend": [False],
+                "isST": [False],
+                "adjfactor": [1.0],
+                "total_share": [1000.0],
+                "float_share": [900.0],
+                "free_share": [800.0],
+                "list_date": ["19910403"],
+            }
+        )
+    if source == "snapshot_tbar":
+        return pl.DataFrame(
+            {
+                **{f"AskPrice{level}": [10.0 + level] for level in range(1, 11)},
+                **{f"BidPrice{level}": [9.0 - level] for level in range(1, 11)},
+                **{f"AskVolume{level}": [100.0 + level] for level in range(1, 11)},
+                **{f"BidVolume{level}": [90.0 + level] for level in range(1, 11)},
+                **{f"aVOI{level}": [float(level)] for level in range(1, 6)},
+                "SecuCode": [1],
+                "MinBar": [930],
+            }
+        )
+    if source == "universe/ex2kamt":
+        return pl.DataFrame(
+            {
+                "sec_code": ["000001.SZ"],
+                "preclose": [9.5],
+                "close": [10.0],
+                "adjfactor": [1.0],
+            }
+        )
+    raise ValueError(f"Unsupported representative source {source!r}.")

@@ -458,7 +458,7 @@ def _write_market_fixture(tmp_path: Path) -> None:
         }
     ).write_parquet(data / "trades_tbar" / "20170103.parquet")
     (data / "daily_k").mkdir()
-    pl.DataFrame({"sec_code": ["000001.SZ"], "trading_day": ["2017-01-03"], "preclose": [9.5]}).write_parquet(
+    pl.DataFrame(_daily_k_fixture_data(["000001.SZ"], ["2017-01-03"], [9.5])).write_parquet(
         data / "daily_k" / "20170103.parquet"
     )
 
@@ -541,3 +541,27 @@ def _write_multi_source_fixture(tmp_path: Path) -> None:
             "No": [1],
         }
     ).write_parquet(data / "quotes_tbar" / "20170103.parquet")
+
+
+def _daily_k_fixture_data(sec_codes: list[str], trading_days: list[str], precloses: list[float]) -> dict:
+    n = len(sec_codes)
+    return {
+        "sec_code": sec_codes,
+        "trading_day": trading_days,
+        "open": [10.0] * n,
+        "high": [11.0] * n,
+        "low": [9.0] * n,
+        "close": [10.5] * n,
+        "shares": [100.0] * n,
+        "amount": [1000.0] * n,
+        "limit_up": [11.0] * n,
+        "limit_down": [9.0] * n,
+        "preclose": precloses,
+        "isSuspend": [False] * n,
+        "isST": [False] * n,
+        "adjfactor": [1.0] * n,
+        "total_share": [1000.0] * n,
+        "float_share": [900.0] * n,
+        "free_share": [800.0] * n,
+        "list_date": ["19910403"] * n,
+    }

@@ -24,6 +24,7 @@ def _source(node: Node, context: EvalContext) -> pl.LazyFrame:
     dates = context.trading_calendar.previous_sessions(context.eval_date, int(node.params.get("lookback_days", 1)))
     source = str(node.params["source"])
     columns = context.sources.schema(source, dates)
+    # Fixed source contracts intentionally narrow extra normalized columns.
     return context.sources.scan(source, dates).select(list(columns))
 
 

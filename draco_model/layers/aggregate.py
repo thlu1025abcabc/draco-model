@@ -214,7 +214,7 @@ def _aggregate_plan_from_schema(
     apply_to: str,
     value_col: object | None,
     alias: object | None,
-) -> tuple[tuple[str, ...], dict[str, FieldInfo]]:
+) -> AggregatePlan:
     values = aggregate_value_columns(parent, value_col)
     if alias is not None and len(values) != 1:
         raise ValueError("Aggregate alias requires exactly one value column.")

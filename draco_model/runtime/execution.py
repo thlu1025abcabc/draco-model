@@ -15,11 +15,9 @@ from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
 
 Executor = Callable[[Node, "EvalContext"], pl.LazyFrame]
 PlanBuilder = Callable[[Node, dict[str, "FrameSchema"], "EvalContext"], "FramePlan"]
-SchemaInferer = Callable[[Node, dict[str, "FrameSchema"], "EvalContext"], "FrameSchema"]
 
 _EXECUTORS: dict[str, Executor] = {}
 _PLAN_BUILDERS: dict[str, PlanBuilder] = {}
-_SCHEMA_INFERERS: dict[str, SchemaInferer] = {}
 
 
 @dataclass(frozen=True)
@@ -111,16 +109,6 @@ def register_plan(op: str) -> Callable[[PlanBuilder], PlanBuilder]:
     return decorator
 
 
-def register_schema(op: str) -> Callable[[SchemaInferer], SchemaInferer]:
-    """Register the function that infers output columns for nodes with an op."""
-
-    def decorator(inferer: SchemaInferer) -> SchemaInferer:
-        _SCHEMA_INFERERS[op] = inferer
-        return inferer
-
-    return decorator
-
-
 def get_executor(op: str) -> Executor:
     """Return the registered executor for an op or raise a clear error."""
     try:
@@ -132,11 +120,6 @@ def get_executor(op: str) -> Executor:
 def get_plan_builder(op: str) -> PlanBuilder | None:
     """Return the registered frame plan builder for an op, if one exists."""
     return _PLAN_BUILDERS.get(op)
-
-
-def get_schema_inferer(op: str) -> SchemaInferer | None:
-    """Return the registered schema inferer for an op, if one exists."""
-    return _SCHEMA_INFERERS.get(op)
 
 
 @dataclass(frozen=True)

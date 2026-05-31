@@ -17,7 +17,6 @@ from draco_model.runtime.execution import (
     format_factor_output,
     get_executor,
     get_plan_builder,
-    get_schema_inferer,
 )
 
 
@@ -144,9 +143,6 @@ class Engine:
         planner = get_plan_builder(node.op)
         if planner is not None:
             return planner(node, parent_schemas, context).schema()
-        inferer = get_schema_inferer(node.op)
-        if inferer is not None:
-            return inferer(node, parent_schemas, context)
         return FrameSchema(tuple(self._eval(model, node, eval_date).collect_schema().names()))
 
 

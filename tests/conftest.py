@@ -51,7 +51,22 @@ def sample_root(tmp_path: Path) -> Path:
         {
             "sec_code": ["000001.SZ", "000002.SZ"],
             "trading_day": ["2017-01-03", "2017-01-03"],
+            "open": [10.0, 20.0],
+            "high": [11.0, 21.0],
+            "low": [9.0, 19.0],
+            "close": [10.5, 20.5],
+            "shares": [100.0, 200.0],
+            "amount": [1000.0, 2000.0],
+            "limit_up": [11.0, 22.0],
+            "limit_down": [9.0, 18.0],
             "preclose": [9.5, 20.0],
+            "isSuspend": [False, False],
+            "isST": [False, False],
+            "adjfactor": [1.0, 1.0],
+            "total_share": [1000.0, 2000.0],
+            "float_share": [900.0, 1800.0],
+            "free_share": [800.0, 1600.0],
+            "list_date": ["19910403", "19910403"],
         },
     )
     return data_root
