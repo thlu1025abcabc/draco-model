@@ -39,6 +39,26 @@ Public alias 和 `Join()` input name 不能以 `__` 开头，也不能使用 `da
 
 旧 public API 已删除：`Field`、`RatioField`、`Auction`、`Resample`、`DailyAgg`、`Concat` 不再导出。
 
+## 文档
+
+更完整的 user guide 和 API reference 放在 [docs/index.md](docs/index.md)。文档按 sklearn / Polars 风格拆成 narrative guide 与 API reference 两层：
+
+- user guide 解释 source schema、aggregation、rolling、payload、debugging 等语义。
+- API reference 覆盖 `Engine`、`Model`、`Source`、`Metric`、`Op`、filters、`Aggregate`、`FillNull`、`Join` 和 `Project`。
+
+文档站使用 MkDocs Material：
+
+```powershell
+python -m pip install -e .[docs]
+python -m mkdocs serve
+```
+
+本地预览地址是 `http://127.0.0.1:8000`。构建静态站点：
+
+```powershell
+python -m mkdocs build
+```
+
 ## Frame Plan 约定
 
 每个 frame layer 都需要注册一个 frame plan。Plan 是该 layer 输出列布局的单一事实源，负责定义 `columns`、`keys`、`grain` 和 `FieldInfo`：

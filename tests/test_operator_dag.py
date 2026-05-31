@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import polars as pl
@@ -355,6 +356,18 @@ def test_collect_daily_output(sample_root: Path) -> None:
         "factor_name": ["close_last"],
         "value": [10.85],
     }
+
+
+def test_collect_emits_run_logging(sample_root: Path, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="draco_model.runtime.engine")
+    raw = Source("trades_tbar")
+    output = Aggregate("1d", "last", value_col="close", alias="value")(Metric("close", raw))
+
+    Engine(data_root=sample_root).collect(Model("close_last", "ex2kamt", output), dates=["20170103"])
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("collect.start model=close_last universe=ex2kamt" in message for message in messages)
+    assert any("collect.done model=close_last universe=ex2kamt" in message for message in messages)
 
 
 def test_collect_concatenates_multiple_dates(tmp_path: Path) -> None:

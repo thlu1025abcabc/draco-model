@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import polars as pl
 
 from draco_model.market.minute_calendar import MinuteCalendar
+
+
+logger = logging.getLogger(__name__)
 
 
 class SourceCatalog:
@@ -18,6 +22,7 @@ class SourceCatalog:
 
     def scan(self, source: str, dates: list[str]) -> pl.LazyFrame:
         """Scan one source across dates as a single LazyFrame."""
+        logger.debug("source.scan source=%s dates=%s", source, dates)
         frames = [self._scan_date(source, date) for date in dates]
         if not frames:
             raise ValueError("Source scan requires at least one date.")
@@ -28,21 +33,26 @@ class SourceCatalog:
         if not dates:
             raise ValueError("Source schema requires at least one date.")
         if source in _FIXED_SOURCE_SCHEMAS:
+            logger.debug("source.schema.fixed source=%s columns=%d", source, len(_FIXED_SOURCE_SCHEMAS[source]))
             return _FIXED_SOURCE_SCHEMAS[source]
+        logger.debug("source.schema.scan source=%s dates=%s", source, dates)
         return tuple(self.scan(source, dates).collect_schema().names())
 
     def _scan_date(self, source: str, date: str) -> pl.LazyFrame:
         key = (source, date)
         if key in self._scans:
+            logger.debug("source.scan_date.cache_hit source=%s date=%s", source, date)
             return self._scans[key]
         path = self.data_root / source / f"{date}.parquet"
         if not path.exists():
             raise FileNotFoundError(f"Missing source file: {path}")
+        logger.debug("source.scan_date.start source=%s date=%s path=%s", source, date, path)
         frame = pl.scan_parquet(path)
         frame = _standardize_columns(frame, date)
         self._validate_fixed_schema(frame, source, date)
         self._validate_minutes(frame, source, date)
         self._scans[key] = frame
+        logger.debug("source.scan_date.done source=%s date=%s", source, date)
         return frame
 
     def _validate_fixed_schema(self, frame: pl.LazyFrame, source: str, date: str) -> None:
@@ -52,16 +62,30 @@ class SourceCatalog:
         actual = tuple(frame.collect_schema().names())
         missing = [column for column in fixed if column not in actual]
         if missing:
+            logger.error(
+                "source.fixed_schema_missing source=%s date=%s missing=%s actual=%s",
+                source,
+                date,
+                missing,
+                list(actual),
+            )
             raise ValueError(
                 f"Source {source!r} date {date} is missing fixed schema columns: {missing}. "
                 f"Actual normalized columns: {list(actual)}."
             )
+        logger.debug("source.fixed_schema_ok source=%s date=%s columns=%d", source, date, len(fixed))
 
     def _validate_minutes(self, frame: pl.LazyFrame, source: str, date: str) -> None:
         schema = frame.collect_schema()
         if "minute" not in schema.names():
             return
         if schema["minute"] != pl.Int64:
+            logger.error(
+                "source.minute_dtype_invalid source=%s date=%s dtype=%s",
+                source,
+                date,
+                schema["minute"],
+            )
             raise ValueError(
                 f"Source {source!r} date {date} has minute column with dtype "
                 f"{schema['minute']}, expected Int64."
@@ -77,6 +101,7 @@ class SourceCatalog:
         )
         if invalid.height:
             values = invalid["minute"].to_list()
+            logger.error("source.minute_grid_invalid source=%s date=%s values=%s", source, date, values)
             raise ValueError(f"Source {source!r} date {date} has minute bars outside fixed grid: {values}.")
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import replace
 
@@ -9,6 +10,9 @@ from draco_model.core import Layer, Node
 from draco_model.layers.names import validate_public_alias
 from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
 from draco_model.runtime.execution import EvalContext, FieldInfo, FramePlan, FrameSchema, register_executor, register_plan
+
+
+logger = logging.getLogger(__name__)
 
 
 class Join(Layer):
@@ -38,6 +42,14 @@ def _join(node: Node, context: EvalContext) -> pl.LazyFrame:
         for input_name, parent in node.inputs.items()
     }
     plan = _join_plan_from_schemas(parent_schemas)
+    logger.debug(
+        "join.start node_id=%s inputs=%s output_grain=%s keys=%s columns=%d",
+        node.id,
+        list(node.inputs),
+        plan.grain,
+        plan.keys,
+        len(plan.columns),
+    )
     for input_name, parent in node.inputs.items():
         schema = parent_schemas[input_name]
         frame = context.evaluate(parent)
@@ -48,7 +60,14 @@ def _join(node: Node, context: EvalContext) -> pl.LazyFrame:
         elif schema.keys == DAILY_KEY_COLUMNS:
             daily_frames.append(selected)
         else:
+            logger.error("join.unrecognized_keys input=%s keys=%s", input_name, schema.keys)
             raise ValueError(f"Join input {input_name!r} does not have recognized keys.")
+    logger.debug(
+        "join.frames node_id=%s intraday=%d daily=%d",
+        node.id,
+        len(intraday_frames),
+        len(daily_frames),
+    )
     if intraday_frames:
         out = pl.concat(intraday_frames, how="align")
         for daily in daily_frames:

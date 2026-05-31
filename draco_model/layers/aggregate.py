@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import polars as pl
@@ -16,6 +17,9 @@ from draco_model.runtime.execution import EvalContext, FieldInfo, FramePlan, Fra
 APPLY_TO_COMPONENTS = "components"
 APPLY_TO_FIELD = "field"
 DAILY_FREQUENCIES = {"1d", "daily"}
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -81,6 +85,18 @@ def _aggregate(node: Node, context: EvalContext) -> pl.LazyFrame:
     value_col = node.params.get("value_col")
     alias = node.params.get("alias")
     auction = str(node.params.get("auction", "keep"))
+    logger.debug(
+        "aggregate.start node_id=%s frequency=%s agg=%s apply_to=%s value_col=%s alias=%s auction=%s parent_grain=%s keys=%s",
+        node.id,
+        frequency,
+        agg,
+        apply_to,
+        value_col,
+        alias,
+        auction,
+        schema.grain,
+        schema.keys,
+    )
 
     if frequency in DAILY_FREQUENCIES:
         if "minute" in schema.columns:
@@ -189,6 +205,14 @@ def _aggregate_values(
 ) -> tuple[pl.LazyFrame, AggregatePlan]:
     grain = "daily" if group_keys == DAILY_KEY_COLUMNS else "minute"
     plan = _aggregate_plan_from_schema(schema, group_keys, grain, apply_to, value_col, alias)
+    logger.debug(
+        "aggregate.plan grain=%s group_keys=%s values=%s payloads=%d columns=%d",
+        grain,
+        group_keys,
+        [spec.output for spec in plan.value_specs],
+        len(plan.payloads),
+        len(plan.columns),
+    )
     exprs: list[pl.Expr] = []
     recompute: list[pl.Expr] = []
 
@@ -272,10 +296,19 @@ def _aggregate_plan_from_schema(
 
 def _apply_auction(frame: pl.LazyFrame, auction: str, context: EvalContext, interval: int) -> pl.LazyFrame:
     if auction == "drop":
+        logger.debug("aggregate.auction_drop interval=%d", interval)
         return frame.filter(~pl.col("minute").is_in(AUCTION_MINUTES))
     if auction == "merge":
         opening_auction, closing_auction = AUCTION_MINUTES
         first_continuous, last_continuous = _auction_merge_targets(context, interval)
+        logger.debug(
+            "aggregate.auction_merge interval=%d opening=%s target_open=%s closing=%s target_close=%s",
+            interval,
+            opening_auction,
+            first_continuous,
+            closing_auction,
+            last_continuous,
+        )
         return frame.with_columns(
             pl.when(pl.col("minute") == opening_auction)
             .then(first_continuous)

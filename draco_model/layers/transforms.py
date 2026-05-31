@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 
 import polars as pl
@@ -7,6 +8,9 @@ import polars as pl
 from draco_model.core import Layer, Node
 from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
 from draco_model.runtime.execution import EvalContext, FieldInfo, FramePlan, FrameSchema, register_executor, register_plan
+
+
+logger = logging.getLogger(__name__)
 
 
 class FillNull(Layer):
@@ -23,7 +27,14 @@ class FillNull(Layer):
             source = _find_unique_source(frame)
             if source is not None:
                 source_name, lookback = source
-                inputs["close_state"] = _build_close_state_subtree(source_name, lookback, _aggregate_transforms(frame))
+                transforms = _aggregate_transforms(frame)
+                logger.debug(
+                    "fill_null.build_close_state source=%s lookback_days=%d transforms=%d",
+                    source_name,
+                    lookback,
+                    len(transforms),
+                )
+                inputs["close_state"] = _build_close_state_subtree(source_name, lookback, transforms)
         return Node(kind="frame", op=self.op, params=dict(self.params), inputs=inputs, name=self.name)
 
 
@@ -35,10 +46,20 @@ def _fill_null(node: Node, context: EvalContext) -> pl.LazyFrame:
     value = node.params.get("value", "state")
     value_col = _single_value_column(schema)
     info = _field_for_column(schema, value_col)
+    logger.debug(
+        "fill_null.start node_id=%s mode=%s value_col=%s grain=%s keys=%s",
+        node.id,
+        value,
+        value_col,
+        schema.grain,
+        schema.keys,
+    )
 
     if _is_numeric_fill(value):
+        logger.debug("fill_null.numeric node_id=%s value_col=%s value=%s", node.id, value_col, value)
         return context.evaluate(parent).with_columns(pl.col(value_col).fill_null(value).alias(value_col)).select(list(plan.columns))
     if value == "ffill":
+        logger.debug("fill_null.ffill node_id=%s value_col=%s", node.id, value_col)
         return (
             context.evaluate(parent)
             .sort(list(schema.keys))
@@ -50,7 +71,9 @@ def _fill_null(node: Node, context: EvalContext) -> pl.LazyFrame:
 
     close_state = _close_state_from_node(node, info, context)
     if info.operator == "preclose":
+        logger.debug("fill_null.state_preclose node_id=%s output_column=%s", node.id, info.column)
         return _preclose_from_state(close_state, info.column)
+    logger.debug("fill_null.state node_id=%s value_col=%s", node.id, value_col)
     return (
         context.evaluate(parent)
         .join(close_state.select([*KEY_COLUMNS, "__close_state"]), on=list(KEY_COLUMNS), how="left")
@@ -79,12 +102,20 @@ def _fill_null_plan_from_schema(parent: FrameSchema) -> FramePlan:
 def _close_state_from_node(node: Node, info: FieldInfo, context: EvalContext) -> pl.LazyFrame:
     if "close_state" in node.inputs:
         close_node = node.inputs["close_state"]
+        logger.debug("close_state.use_input node_id=%s close_node_id=%s", node.id, close_node.id)
     else:
         if info.source is None:
             raise ValueError("FillNull('state') requires source lineage.")
         close_node = _build_close_state_subtree(info.source, info.lookback_days, ())
+        logger.debug(
+            "close_state.build_from_lineage node_id=%s source=%s lookback_days=%d",
+            node.id,
+            info.source,
+            info.lookback_days,
+        )
     close = context.evaluate(close_node)
     dates = context.trading_calendar.previous_sessions(context.eval_date, info.lookback_days)
+    logger.debug("close_state.daily_preclose dates=%s", dates)
     daily_preclose = _daily_preclose_frame(context, dates)
     return (
         close.join(daily_preclose, on=list(DAILY_KEY_COLUMNS), how="left")

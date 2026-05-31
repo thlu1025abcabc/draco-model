@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import polars as pl
@@ -94,7 +95,10 @@ def test_fixed_source_schemas_match_standardized_representative_columns() -> Non
         assert missing == [], f"{source} fixed schema missing from standardized columns: {missing}"
 
 
-def test_fixed_source_missing_column_raises_clear_error(tmp_path: Path) -> None:
+def test_fixed_source_missing_column_raises_clear_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.ERROR, logger="draco_model.data.source")
     _write_trading_days(tmp_path)
     path = tmp_path / "data" / "trades_tbar" / "20170103.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,6 +118,7 @@ def test_fixed_source_missing_column_raises_clear_error(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="missing fixed schema columns.*vw_wait_time"):
         Engine(data_root=tmp_path / "data").evaluate(Model("bad_source", "ex2kamt", raw), raw, "20170103").collect()
+    assert "source.fixed_schema_missing source=trades_tbar date=20170103" in caplog.text
 
 
 def test_fixed_source_plans_have_expected_keys_and_grain(tmp_path: Path) -> None:

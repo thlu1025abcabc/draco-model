@@ -1,0 +1,74 @@
+site_name: Draco Model
+site_description: Polars-backed factor DAG library
+site_url: https://thlu1025abcabc.github.io/draco-model/
+repo_url: https://github.com/thlu1025abcabc/draco-model
+repo_name: thlu1025abcabc/draco-model
+use_directory_urls: false
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - User Guide:
+      - Quickstart: user-guide/quickstart.md
+      - Data Sources: user-guide/data-sources.md
+      - Aggregation: user-guide/aggregation.md
+      - Rolling Operators: user-guide/rolling.md
+      - Payload Semantics: user-guide/payload.md
+      - Debugging: user-guide/debugging.md
+  - API Reference:
+      - Overview: api/index.md
+      - Engine: api/engine.md
+      - Model, Node, and TraceStep: api/model.md
+      - Layers:
+          - Source: api/layers/source.md
+          - Metric: api/layers/metrics.md
+          - Operators: api/layers/operators.md
+          - Filters: api/layers/filters.md
+          - Aggregate: api/layers/aggregate.md
+          - FillNull: api/layers/transforms.md
+          - Join and Project: api/layers/combine.md
