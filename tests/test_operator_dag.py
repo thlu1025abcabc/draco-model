@@ -1,20 +1,38 @@
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 from pathlib import Path
 
 import polars as pl
 import pytest
 
+import draco_model.runtime.engine as engine_module
 from draco_model import Engine, Model
-from draco_model.layers import Aggregate, Col, FillNull, Join, Metric, Op, Project, Side, Source, Threshold, Where
+from draco_model.layers import Aggregate, Col, FillNull, Grid, Join, Metric, Op, Project, Side, Source, Threshold, Where
 from draco_model.layers.aggregate import _auction_merge_targets
 from draco_model.market.minute_calendar import MinuteCalendar
-from draco_model.runtime.execution import get_plan_builder
+from draco_model.runtime.execution import get_info_builder
 
 
 class _Context:
     minute_calendar = MinuteCalendar()
+
+
+BUILTIN_FRAME_OPS = (
+    "aggregate",
+    "column",
+    "fill_null",
+    "grid",
+    "join",
+    "metric_reserved",
+    "op",
+    "project",
+    "rename",
+    "source",
+    "where",
+)
 
 
 def test_magic_arithmetic_builds_operator_nodes() -> None:
@@ -93,6 +111,34 @@ def test_threshold_filter_keeps_matching_rows(sample_root: Path) -> None:
     assert rows == {"minute": [932, 933], "volume": [30.0, 20.0]}
 
 
+def test_condition_nodes_do_not_capture_frame_subtrees() -> None:
+    raw = Source("trades_tbar")
+    other = Source("quotes_tbar")
+    raw_where = Where(Side("buy"))(raw)
+    other_where = Where(Side("buy"))(other)
+    raw_condition = raw_where.inputs["condition"]
+    other_condition = other_where.inputs["condition"]
+
+    assert raw_where.inputs["frame"] is raw
+    assert raw_condition.inputs == {}
+    assert other_condition.inputs == {}
+    assert raw_condition.id == other_condition.id
+
+
+def test_filtered_raw_column_keeps_source_lineage(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    filtered_price = Col("price").alias("filtered_price")(Where(Threshold("minute", op="==", value=931))(raw))
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+
+    schema = engine._infer_info(Model("filtered_price_lineage", "ex2kamt", filtered_price), filtered_price, "20170103")
+    info = schema.fields["filtered_price"]
+
+    assert info.source == "trades_tbar"
+    assert info.lookback_days == 1
+    assert info.grain_path == ()
+
+
 def test_vwap_component_and_field_aggregation(sample_root: Path) -> None:
     raw = Source("trades_tbar")
     vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
@@ -141,6 +187,7 @@ def test_auction_merge_targets_follow_output_frequency() -> None:
     assert _auction_merge_targets(context, 15) == (930, 1445)
 
 
+# Grid-like null bars should not contribute to daily mean denominators.
 def test_daily_aggregate_applies_auction_policy(sample_root: Path) -> None:
     raw = Source("trades_tbar")
     volume = Metric("volume", raw)
@@ -153,9 +200,9 @@ def test_daily_aggregate_applies_auction_policy(sample_root: Path) -> None:
     drop_value = engine.evaluate(Model("daily_drop", "ex2kamt", drop), drop, "20170103").collect()["value"].to_list()
     merge_value = engine.evaluate(Model("daily_merge", "ex2kamt", merge), merge, "20170103").collect()["value"].to_list()
 
-    assert keep_value == pytest.approx([85.0 / 7.0])
-    assert drop_value == pytest.approx([65.0 / 5.0])
-    assert merge_value == pytest.approx([72.5 / 6.0])
+    assert keep_value == pytest.approx([85.0 / 5.0])
+    assert drop_value == pytest.approx([65.0 / 3.0])
+    assert merge_value == pytest.approx([72.5 / 4.0])
 
 
 def test_scalar_arithmetic_on_metric(sample_root: Path) -> None:
@@ -279,9 +326,104 @@ def test_fillnull_state_for_vwap_and_preclose(sample_root: Path) -> None:
     assert any(column.startswith("__op_vwap") for column in vwap_frame.columns)
 
 
+def test_fillnull_state_uses_grain_path_after_operator(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    null_price = Col("price").alias("probe")(Where(Threshold("minute", op="==", value=931))(raw))
+    five_minute = Aggregate("5m", "last", value_col="probe", alias="probe")(null_price)
+    shifted = (five_minute + 0).alias("probe_shifted")
+    filled = FillNull("state")(shifted)
+
+    frame = Engine(data_root=sample_root).evaluate(
+        Model("filled_after_operator", "ex2kamt", filled),
+        filled,
+        "20170103",
+    ).collect()
+
+    row = frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 930))
+    assert row["probe_shifted"].to_list() == [10.3]
+
+
+def test_fillnull_state_rejects_multi_source_lineage(tmp_path: Path) -> None:
+    _write_multi_source_fixture(tmp_path)
+    trade_volume = Metric("volume", Source("trades_tbar"))
+    quote_volume = Metric("volume", Source("quotes_tbar"))
+    filled = FillNull("state")((trade_volume - quote_volume).alias("net_volume"))
+
+    with pytest.raises(ValueError, match="requires source lineage"):
+        Engine(data_root=tmp_path / "data").evaluate(
+            Model("multi_source_fill", "ex2kamt", filled),
+            filled,
+            "20170103",
+        ).collect()
+
+
+def test_grid_aligns_minute_frame_to_universe_calendar(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    gridded = Grid()(Metric("volume", raw))
+
+    frame = Engine(data_root=sample_root).evaluate(Model("grid_volume", "ex2kamt", gridded), gridded, "20170103").collect()
+
+    assert frame.height == 2 * len(MinuteCalendar().minbars())
+    assert frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 930))["volume"].to_list() == [15.0]
+    assert frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 934))["volume"].to_list() == [None]
+    assert frame.filter((pl.col("secu_code") == 2) & (pl.col("minute") == 930))["volume"].to_list() == [None]
+
+
+def test_grid_uses_explicit_resampled_frequency(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    volume_5m = Aggregate("5m", "sum", value_col="volume")(Metric("volume", raw))
+    gridded = Grid("5m")(volume_5m)
+
+    frame = Engine(data_root=sample_root).evaluate(Model("grid_volume_5m", "ex2kamt", gridded), gridded, "20170103").collect()
+    minutes = frame.filter(pl.col("secu_code") == 1)["minute"].unique().sort().to_list()
+
+    assert 934 not in minutes
+    assert 935 in minutes
+    assert 925 in minutes
+    assert 1500 in minutes
+
+
+def test_grid_infers_frequency_and_removed_auction_from_grain_path(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    volume_5m = Aggregate("5m", "sum", value_col="volume", auction="drop")(Metric("volume", raw))
+    volume_15m = Aggregate("15m", "sum", value_col="volume", auction="keep")(volume_5m)
+    gridded = Grid()((volume_15m + 0).alias("volume_shifted"))
+
+    frame = Engine(data_root=sample_root).evaluate(
+        Model("grid_inferred_15m_drop", "ex2kamt", gridded),
+        gridded,
+        "20170103",
+    ).collect()
+    minutes = frame.filter(pl.col("secu_code") == 1)["minute"].unique().sort().to_list()
+
+    assert 945 in minutes
+    assert 935 not in minutes
+    assert 925 not in minutes
+    assert 1500 not in minutes
+
+
+def test_grid_aligns_raw_source_before_metric(sample_root: Path) -> None:
+    gridded = Grid()(Source("trades_tbar"))
+    engine = Engine(data_root=sample_root)
+
+    raw_frame = engine.evaluate(Model("grid_raw", "ex2kamt", gridded), gridded, "20170103").collect()
+
+    assert raw_frame.height == 2 * len(MinuteCalendar().minbars()) + 1
+    assert raw_frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 930))["volume"].sort().to_list() == [5.0, 10.0]
+    assert raw_frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 934))["price"].to_list() == [None]
+    assert raw_frame.filter((pl.col("secu_code") == 2) & (pl.col("minute") == 930))["price"].to_list() == [None]
+
+    volume = Metric("volume", gridded)
+    volume_frame = engine.evaluate(Model("grid_raw_volume", "ex2kamt", volume), volume, "20170103").collect()
+
+    assert volume_frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 930))["volume"].to_list() == [15.0]
+    assert volume_frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 934))["volume"].to_list() == [None]
+    assert volume_frame.filter((pl.col("secu_code") == 2) & (pl.col("minute") == 930))["volume"].to_list() == [None]
+
+
 def test_fillnull_ffill_and_numeric_modes(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    close = Metric("close", raw)
+    close = Grid()(Metric("close", raw))
     ffilled = FillNull("ffill")(close)
     zero_filled = FillNull(0)(close)
     engine = Engine(data_root=sample_root)
@@ -408,7 +550,7 @@ def test_trace_and_mermaid_show_expanded_operator_dag(sample_root: Path) -> None
     assert "ratio_field" not in mermaid
 
 
-def test_frame_plans_match_materialized_columns(sample_root: Path) -> None:
+def test_frame_infos_match_materialized_columns(sample_root: Path) -> None:
     raw = Source("trades_tbar")
     vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
     filled = FillNull("state")(vwap)
@@ -422,14 +564,58 @@ def test_frame_plans_match_materialized_columns(sample_root: Path) -> None:
     for node in model.nodes():
         if node.kind != "frame":
             continue
-        schema = engine._infer_schema(model, node, "20170103")
+        schema = engine._infer_info(model, node, "20170103")
         frame = engine.evaluate(model, node, "20170103").collect()
         assert tuple(frame.columns) == schema.columns
 
 
-def test_builtin_frame_layers_register_plans() -> None:
-    for op in ["aggregate", "column", "fill_null", "join", "metric_reserved", "op", "project", "rename", "source", "where"]:
-        assert get_plan_builder(op) is not None
+def test_info_inference_memoizes_shared_nodes(sample_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = Source("trades_tbar")
+    vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
+    model = Model("memoized_schema", "ex2kamt", vwap)
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+    calls: dict[str, int] = {}
+    original_get_info_builder = engine_module.get_info_builder
+
+    def counting_get_info_builder(op: str):
+        calls[op] = calls.get(op, 0) + 1
+        return original_get_info_builder(op)
+
+    monkeypatch.setattr(engine_module, "get_info_builder", counting_get_info_builder)
+
+    schema = engine._infer_info(model, vwap, "20170103")
+    calls_after_first_infer = dict(calls)
+    cached_schema = engine._infer_info(model, vwap, "20170103")
+
+    assert cached_schema is schema
+    assert calls == calls_after_first_infer
+    assert calls["source"] == 1
+
+
+def test_builtin_frame_layers_register_info_builders() -> None:
+    for op in BUILTIN_FRAME_OPS:
+        assert get_info_builder(op) is not None
+
+
+def test_package_import_bootstraps_builtin_layer_registry() -> None:
+    code = f"""
+import draco_model
+from draco_model.runtime.execution import get_executor, get_info_builder
+
+for op in {BUILTIN_FRAME_OPS!r}:
+    get_executor(op)
+    assert get_info_builder(op) is not None, op
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def test_join_evaluates_distinct_sources(tmp_path: Path) -> None:

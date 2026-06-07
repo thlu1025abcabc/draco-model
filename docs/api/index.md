@@ -14,7 +14,7 @@ This section documents public APIs exported from `draco_model` and `draco_model.
 - [Operators](layers/operators.md)
 - [Filters](layers/filters.md)
 - [Aggregate](layers/aggregate.md)
-- [FillNull](layers/transforms.md)
+- [Grid and FillNull](layers/transforms.md)
 - [Join and Project](layers/combine.md)
 
 ## Conventions

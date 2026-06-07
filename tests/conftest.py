@@ -38,12 +38,12 @@ def sample_root(tmp_path: Path) -> Path:
             "SecuCode": [1, 1, 1, 1, 1, 1, 1, 1],
             "MinBar": [925, 930, 930, 931, 932, 933, 935, 1500],
             "Price": [9.85, 10.1, 10.2, None, 10.5, 10.3, None, 10.85],
-            "Side": [0, 0, 0, 0, 0, 0, 0, 0],
-            "Volume": [10.0, 10.0, 5.0, 0.0, 30.0, 20.0, 0.0, 10.0],
-            "vw_wait_time": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            "isfirst": [True, True, False, True, True, True, True, True],
-            "islast": [True, False, True, True, True, True, True, True],
-            "No": [1, 99, 1, 3, 4, 5, 6, 7],
+            "Side": [0, 0, 0, None, 0, 0, None, 0],
+            "Volume": [10.0, 10.0, 5.0, None, 30.0, 20.0, None, 10.0],
+            "vw_wait_time": [0.0, 0.0, 0.0, None, 0.0, 0.0, None, 0.0],
+            "isfirst": [True, True, False, None, True, True, None, True],
+            "islast": [True, False, True, None, True, True, None, True],
+            "No": [1, 99, 1, None, 4, 5, None, 7],
         },
     )
     _write_parquet(

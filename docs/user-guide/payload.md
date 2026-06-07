@@ -28,6 +28,8 @@ The public field is `vwap`, while internal payload stores the operands needed fo
 
 `FillNull()` preserves payload columns, but the filled public field is no longer marked as fully recomputable from its old components. After fill, the public column is the authoritative field value.
 
+For `FillNull("state")`, close-state is built from the field's source lineage and aggregate path, then aligned to the frame keys being filled. This keeps state fill aligned with prior resampling and explicit grid rows, and rejects multi-source fields whose close-state source would be ambiguous.
+
 ## Aggregate
 
 `Aggregate(apply_to="field")` aggregates the public output and retains payload at the target grain for lineage/debugging. Retained payload does not promise that the aggregated public field can be recomputed from it.

@@ -8,7 +8,7 @@ import polars as pl
 from draco_model.core import Node
 from draco_model.layers.names import validate_public_alias
 from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
-from draco_model.runtime.execution import EvalContext, FieldInfo, FramePlan, FrameSchema, register_executor, register_plan
+from draco_model.runtime.execution import EvalContext, FieldInfo, FrameInfo, register_executor, register_info
 
 
 ARITHMETIC_OPS = {"add", "sub", "mul", "div"}
@@ -133,35 +133,36 @@ def alias_node(node: Node, alias: str) -> Node:
 
 @register_executor("column")
 def _column(node: Node, context: EvalContext) -> pl.LazyFrame:
-    parent_schema = context.infer_schema(node.inputs["input"])
-    plan = _column_plan_from_schema(node, parent_schema)
+    parent_schema = context.infer_info(node.inputs["input"])
+    info = _column_info_from_parent(node, parent_schema)
     frame = context.evaluate(node.inputs["input"])
     column = str(node.params["column"])
     alias = str(node.params["alias"])
     _require_columns(list(parent_schema.columns), [column])
-    return frame.with_columns(pl.col(column).alias(alias)).select(list(plan.columns))
+    return frame.with_columns(pl.col(column).alias(alias)).select(list(info.columns))
 
 
-@register_plan("column")
-def _column_plan(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FramePlan:
-    return _column_plan_from_schema(node, parent_schemas["input"])
+@register_info("column")
+def _column_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalContext) -> FrameInfo:
+    return _column_info_from_parent(node, parent_infos["input"])
 
 
-def _column_plan_from_schema(node: Node, parent: FrameSchema) -> FramePlan:
+def _column_info_from_parent(node: Node, parent: FrameInfo) -> FrameInfo:
     column = str(node.params["column"])
     alias = str(node.params["alias"])
     _require_columns(list(parent.columns), [column])
     columns = _append_column(parent.columns, alias)
-    return FramePlan(
-        columns=columns,
-        keys=parent.keys,
-        grain=parent.grain,
+    source, lookback, grain_path = _lineage_for_column(parent, column)
+    return FrameInfo.from_columns(
+        columns,
+        identity_keys=parent.keys,
         fields={
             alias: FieldInfo(
                 alias,
                 alias,
-                source=_source_from_node(node.inputs["input"], parent),
-                lookback_days=_lookback_from_node(node.inputs["input"], parent),
+                source=source,
+                lookback_days=lookback,
+                grain_path=grain_path,
             )
         },
     )
@@ -175,31 +176,32 @@ def _op(node: Node, context: EvalContext) -> pl.LazyFrame:
     return _frame_op_executor(node, context)
 
 
-@register_plan("op")
-def _op_plan(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FramePlan:
+@register_info("op")
+def _op_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalContext) -> FrameInfo:
     mode = str(node.params.get("mode", "frame"))
     if mode == "row":
-        parent = parent_schemas["input"]
+        parent = parent_infos["input"]
         alias = str(node.params["alias"])
-        return FramePlan(
-            columns=_append_column(parent.columns, alias),
-            keys=parent.keys,
-            grain=parent.grain,
+        source, lookback, grain_path = _lineage_from_schema(parent)
+        return FrameInfo.from_columns(
+            _append_column(parent.columns, alias),
+            identity_keys=parent.keys,
             fields={
                 alias: FieldInfo(
                     name=alias,
                     column=alias,
                     operator=str(node.params["name"]),
-                    source=_source_from_node(node.inputs["input"], parent),
-                    lookback_days=_lookback_from_node(node.inputs["input"], parent),
+                    source=source,
+                    lookback_days=lookback,
                     component_agg=False,
+                    grain_path=grain_path,
                 )
             },
         )
 
     alias = str(node.params["alias"])
     name = str(node.params["name"])
-    input_schemas = [schema for key, schema in parent_schemas.items() if key.startswith("operand")]
+    input_schemas = [schema for key, schema in parent_infos.items() if key.startswith("operand")]
     keys = _common_keys(input_schemas)
     components = tuple(f"__op_{alias}_{idx}" for idx, _ in enumerate(input_schemas))
     specs = [dict(spec) for spec in node.params["operands"]]
@@ -210,51 +212,59 @@ def _op_plan(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalCo
     )
     payloads = tuple(
         renamed
-        for input_name, schema in parent_schemas.items()
+        for input_name, schema in parent_infos.items()
         if input_name.startswith("operand")
         for renamed in _payload_renames(input_name, schema).values()
     )
+    source, lookback, grain_path = _common_lineage(input_schemas)
     columns = (*keys, alias, *components, *payloads)
-    return FramePlan(
-        columns=columns,
-        keys=keys,
-        grain=_common_grain(input_schemas),
-        fields={
-            alias: FieldInfo(
-                name=alias,
-                column=alias,
-                operator=name,
-                components=components,
-                source=_common_source(input_schemas),
-                lookback_days=_common_lookback(input_schemas),
-                component_agg=can_component_agg,
-            )
-        },
+    fields: dict[str, FieldInfo] = {
+        alias: FieldInfo(
+            name=alias,
+            column=alias,
+            operator=name,
+            components=components,
+            source=source,
+            lookback_days=lookback,
+            component_agg=can_component_agg,
+            grain_path=grain_path,
+        )
+    }
+    for payload in payloads:
+        fields[payload] = FieldInfo(payload, payload, is_public=False, is_payload=True)
+    return FrameInfo.from_columns(
+        columns,
+        identity_keys=keys,
+        fields=fields,
     )
 
 
 @register_executor("rename")
 def _rename(node: Node, context: EvalContext) -> pl.LazyFrame:
     parent = node.inputs["input"]
-    schema = context.infer_schema(parent)
-    plan = _rename_plan_from_schema(node, schema)
+    schema = context.infer_info(parent)
+    info = _rename_info_from_parent(node, schema)
     value = _single_value_column(schema)
     alias = str(node.params["alias"])
-    return context.evaluate(parent).rename({value: alias}).select(list(plan.columns))
+    return context.evaluate(parent).rename({value: alias}).select(list(info.columns))
 
 
-@register_plan("rename")
-def _rename_plan(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FramePlan:
-    return _rename_plan_from_schema(node, parent_schemas["input"])
+@register_info("rename")
+def _rename_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalContext) -> FrameInfo:
+    return _rename_info_from_parent(node, parent_infos["input"])
 
 
-def _rename_plan_from_schema(node: Node, parent: FrameSchema) -> FramePlan:
+def _rename_info_from_parent(node: Node, parent: FrameInfo) -> FrameInfo:
     value = _single_value_column(parent)
     alias = str(node.params["alias"])
     columns = tuple(alias if column == value else column for column in parent.columns)
     info = _field_info_for_column(parent, value)
     fields = {alias: replace(info, name=alias, column=alias)}
-    return FramePlan(columns=columns, keys=parent.keys, grain=parent.grain, fields=fields)
+    return FrameInfo.from_columns(
+        columns,
+        identity_keys=parent.keys,
+        fields=fields,
+    )
 
 
 def _frame_op(name: str, operands: list[Any], alias: str | None, params: dict[str, Any]) -> Node:
@@ -281,14 +291,14 @@ def _frame_op(name: str, operands: list[Any], alias: str | None, params: dict[st
 
 def _row_op(node: Node, context: EvalContext) -> pl.LazyFrame:
     parent = node.inputs["input"]
-    schema = context.infer_schema(parent)
-    plan = _op_plan(node, {"input": schema}, context)
+    schema = context.infer_info(parent)
+    info = _op_info(node, {"input": schema}, context)
     columns = list(schema.columns)
     alias = str(node.params["alias"])
     expr = _expr_from_spec(dict(node.params["operands"][0]), columns)
     for spec in list(node.params["operands"])[1:]:
         expr = _combine_expr(str(node.params["name"]), expr, _expr_from_spec(dict(spec), columns))
-    return context.evaluate(parent).with_columns(expr.alias(alias)).select(list(plan.columns))
+    return context.evaluate(parent).with_columns(expr.alias(alias)).select(list(info.columns))
 
 
 def _frame_op_executor(node: Node, context: EvalContext) -> pl.LazyFrame:
@@ -296,11 +306,11 @@ def _frame_op_executor(node: Node, context: EvalContext) -> pl.LazyFrame:
     operator = str(node.params["name"])
     specs = list(node.params["operands"])
     parent_schemas = {
-        input_name: context.infer_schema(parent)
+        input_name: context.infer_info(parent)
         for input_name, parent in node.inputs.items()
         if input_name.startswith("operand")
     }
-    plan = _op_plan(node, parent_schemas, context)
+    info = _op_info(node, parent_schemas, context)
     frames: list[pl.LazyFrame] = []
     keys: tuple[str, ...] | None = None
     expr_operands: list[pl.Expr] = []
@@ -352,7 +362,7 @@ def _frame_op_executor(node: Node, context: EvalContext) -> pl.LazyFrame:
             [*component_columns, *payload_columns],
         )
     out_expr = _combine_many(operator, expr_operands).alias(alias)
-    return frame.with_columns(out_expr).select(list(plan.columns))
+    return frame.with_columns(out_expr).select(list(info.columns))
 
 
 def _window_op(
@@ -477,52 +487,76 @@ def _combine_expr(operator: str, left: pl.Expr, right: pl.Expr) -> pl.Expr:
     raise ValueError(f"Unsupported arithmetic operator {operator!r}.")
 
 
-def _single_value_column(schema: FrameSchema) -> str:
+def _single_value_column(schema: FrameInfo) -> str:
     values = schema.value_columns()
     if len(values) != 1:
         raise ValueError(f"Operator requires exactly one public value column, got {values}.")
     return values[0]
 
 
-def _payload_renames(input_name: str, schema: FrameSchema) -> dict[str, str]:
-    payloads = [
-        column
-        for column in schema.columns
-        if column not in schema.keys and column.startswith("__")
-    ]
+def _payload_renames(input_name: str, schema: FrameInfo) -> dict[str, str]:
+    payloads = schema.payload_columns()
     return {column: f"__{input_name}_{column.lstrip('_')}" for column in payloads}
 
 
-def _field_info_for_column(schema: FrameSchema, column: str) -> FieldInfo:
-    for info in schema.fields.values():
-        if info.column == column:
-            return info
-    return FieldInfo(column, column, source=_single_source(schema), lookback_days=_single_lookback(schema))
+def _field_info_for_column(schema: FrameInfo, column: str) -> FieldInfo:
+    if column in schema.fields:
+        return schema.fields[column]
+    source, lookback, grain_path = _lineage_for_column(schema, column)
+    return FieldInfo(column, column, source=source, lookback_days=lookback, grain_path=grain_path)
 
 
-def _single_source(schema: FrameSchema) -> str | None:
-    sources = {info.source for info in schema.fields.values() if info.source is not None}
-    return next(iter(sources)) if len(sources) == 1 else None
+def _lineage_for_column(schema: FrameInfo, column: str) -> tuple[str | None, int, tuple[tuple[str, str], ...]]:
+    if column in schema.fields:
+        info = schema.fields[column]
+        return info.source, info.lookback_days, info.grain_path
+    return _lineage_from_schema(schema)
 
 
-def _source_from_node(node: Node, schema: FrameSchema) -> str | None:
-    if node.op == "source":
-        return str(node.params["source"])
-    return _single_source(schema)
+def _lineage_from_schema(schema: FrameInfo) -> tuple[str | None, int, tuple[tuple[str, str], ...]]:
+    infos = _lineage_fields(schema)
+    if not infos:
+        return None, _single_lookback(schema), ()
+    if any(info.source is None for info in infos):
+        return None, _single_lookback(schema), ()
+    sources = {info.source for info in infos}
+    grain_paths = {info.grain_path for info in infos}
+    if len(sources) != 1 or len(grain_paths) != 1:
+        return None, _single_lookback(schema), ()
+    source = next(iter(sources))
+    grain_path = next(iter(grain_paths))
+    return source, _single_lookback(schema), grain_path
 
 
-def _single_lookback(schema: FrameSchema) -> int:
-    values = {info.lookback_days for info in schema.fields.values()}
+def _common_lineage(schemas: list[FrameInfo]) -> tuple[str | None, int, tuple[tuple[str, str], ...]]:
+    lookback = _common_lookback(schemas)
+    lineages = [_lineage_from_schema(schema) for schema in schemas]
+    if any(source is None for source, _, _ in lineages):
+        return None, lookback, ()
+    sources = {source for source, _, _ in lineages}
+    grain_paths = {grain_path for _, _, grain_path in lineages}
+    if len(sources) == 1 and len(grain_paths) == 1:
+        return next(iter(sources)), lookback, next(iter(grain_paths))
+    return None, lookback, ()
+
+
+def _lineage_fields(schema: FrameInfo) -> tuple[FieldInfo, ...]:
+    values = tuple(
+        info
+        for info in schema.fields.values()
+        if info.is_public and not info.is_identity and not info.is_payload
+    )
+    if values:
+        return values
+    return tuple(info for info in schema.fields.values() if not info.is_payload)
+
+
+def _single_lookback(schema: FrameInfo) -> int:
+    values = {info.lookback_days for info in _lineage_fields(schema)}
     return next(iter(values)) if len(values) == 1 else 1
 
 
-def _lookback_from_node(node: Node, schema: FrameSchema) -> int:
-    if node.op == "source":
-        return int(node.params.get("lookback_days", 1))
-    return _single_lookback(schema)
-
-
-def _common_keys(schemas: list[FrameSchema]) -> tuple[str, ...]:
+def _common_keys(schemas: list[FrameInfo]) -> tuple[str, ...]:
     if not schemas:
         raise ValueError("Operator requires at least one input schema.")
     keys = schemas[0].keys
@@ -531,18 +565,12 @@ def _common_keys(schemas: list[FrameSchema]) -> tuple[str, ...]:
     return keys
 
 
-def _common_grain(schemas: list[FrameSchema]) -> str:
+def _common_grain(schemas: list[FrameInfo]) -> str:
     grains = {schema.grain for schema in schemas}
     return next(iter(grains)) if len(grains) == 1 else "unknown"
 
 
-def _common_source(schemas: list[FrameSchema]) -> str | None:
-    sources = {_single_source(schema) for schema in schemas}
-    sources.discard(None)
-    return next(iter(sources)) if len(sources) == 1 else None
-
-
-def _common_lookback(schemas: list[FrameSchema]) -> int:
+def _common_lookback(schemas: list[FrameInfo]) -> int:
     values = {_single_lookback(schema) for schema in schemas}
     return max(values) if values else 1
 

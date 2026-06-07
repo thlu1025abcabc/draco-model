@@ -5,7 +5,7 @@ from typing import Any, Callable
 import polars as pl
 
 from draco_model.core import Condition, Layer, Node
-from draco_model.runtime.execution import EvalContext, FramePlan, FrameSchema, register_executor, register_plan
+from draco_model.runtime.execution import EvalContext, FrameInfo, register_executor, register_info
 
 
 ConditionExpression = Callable[[Node], pl.Expr]
@@ -78,9 +78,9 @@ def _where(node: Node, context: EvalContext) -> pl.LazyFrame:
     return context.evaluate(node.inputs["frame"]).filter(_condition_expr(node.inputs["condition"]))
 
 
-@register_plan("where")
-def _where_plan(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FramePlan:
-    return FramePlan.from_schema(parent_schemas["frame"])
+@register_info("where")
+def _where_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalContext) -> FrameInfo:
+    return parent_infos["frame"]
 
 
 def _condition_expr(node: Node) -> pl.Expr:

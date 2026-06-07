@@ -5,8 +5,7 @@ import logging
 import polars as pl
 
 from draco_model.core import Node
-from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
-from draco_model.runtime.execution import EvalContext, FramePlan, FrameSchema, register_executor, register_plan
+from draco_model.runtime.execution import EvalContext, FrameInfo, register_executor, register_info
 
 
 logger = logging.getLogger(__name__)
@@ -34,17 +33,16 @@ def _source(node: Node, context: EvalContext) -> pl.LazyFrame:
     return context.sources.scan(source, dates).select(list(columns))
 
 
-@register_plan("source")
-def _source_plan(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FramePlan:
-    dates = context.trading_calendar.previous_sessions(context.eval_date, int(node.params.get("lookback_days", 1)))
-    columns = context.sources.schema(str(node.params["source"]), dates)
-    if all(column in columns for column in KEY_COLUMNS):
-        keys = KEY_COLUMNS
-        grain = "raw"
-    elif all(column in columns for column in DAILY_KEY_COLUMNS):
-        keys = DAILY_KEY_COLUMNS
-        grain = "daily"
-    else:
-        keys = ()
-        grain = "raw"
-    return FramePlan(columns=columns, keys=keys, grain=grain)
+@register_info("source")
+def _source_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalContext) -> FrameInfo:
+    source = str(node.params["source"])
+    lookback_days = int(node.params.get("lookback_days", 1))
+    dates = context.trading_calendar.previous_sessions(context.eval_date, lookback_days)
+    columns = context.sources.schema(source, dates)
+    identity_keys = context.sources.identity_keys(source, dates)
+    return FrameInfo.from_columns(
+        columns,
+        identity_keys=identity_keys,
+        source=source,
+        lookback_days=lookback_days,
+    )

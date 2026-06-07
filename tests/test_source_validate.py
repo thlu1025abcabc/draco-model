@@ -121,14 +121,14 @@ def test_fixed_source_missing_column_raises_clear_error(
     assert "source.fixed_schema_missing source=trades_tbar date=20170103" in caplog.text
 
 
-def test_fixed_source_plans_have_expected_keys_and_grain(tmp_path: Path) -> None:
+def test_fixed_source_infos_have_expected_keys_and_grain(tmp_path: Path) -> None:
     _write_trading_days(tmp_path)
     engine = Engine(data_root=tmp_path / "data")
     engine._ensure_calendar()
     expected = {
-        "trades_tbar": (KEY_COLUMNS, "raw"),
-        "cancels_tbar": (KEY_COLUMNS, "raw"),
-        "quotes_tbar": (KEY_COLUMNS, "raw"),
+        "trades_tbar": ((*KEY_COLUMNS, "price", "side"), "raw"),
+        "cancels_tbar": ((*KEY_COLUMNS, "price", "side"), "raw"),
+        "quotes_tbar": ((*KEY_COLUMNS, "price", "side"), "raw"),
         "snapshot_tbar": (KEY_COLUMNS, "raw"),
         "daily_k": (DAILY_KEY_COLUMNS, "daily"),
         "universe/ex2kamt": (DAILY_KEY_COLUMNS, "daily"),
@@ -136,7 +136,7 @@ def test_fixed_source_plans_have_expected_keys_and_grain(tmp_path: Path) -> None
 
     for source, (keys, grain) in expected.items():
         node = Source(source)
-        schema = engine._infer_schema(Model(f"schema_{source.replace('/', '_')}", "ex2kamt", node), node, "20170103")
+        schema = engine._infer_info(Model(f"schema_{source.replace('/', '_')}", "ex2kamt", node), node, "20170103")
         assert schema.keys == keys
         assert schema.grain == grain
 

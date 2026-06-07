@@ -6,6 +6,7 @@ from pathlib import Path
 import polars as pl
 
 from draco_model.market.minute_calendar import MinuteCalendar
+from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
 
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,20 @@ class SourceCatalog:
             return _FIXED_SOURCE_SCHEMAS[source]
         logger.debug("source.schema.scan source=%s dates=%s", source, dates)
         return tuple(self.scan(source, dates).collect_schema().names())
+
+    def identity_keys(self, source: str, dates: list[str]) -> tuple[str, ...]:
+        """Return normalized row identity columns for a source."""
+        if not dates:
+            raise ValueError("Source identity keys require at least one date.")
+        fixed = _FIXED_SOURCE_IDENTITY_KEYS.get(source)
+        if fixed is not None:
+            return fixed
+        columns = self.schema(source, dates)
+        if all(column in columns for column in KEY_COLUMNS):
+            return KEY_COLUMNS
+        if all(column in columns for column in DAILY_KEY_COLUMNS):
+            return DAILY_KEY_COLUMNS
+        return ()
 
     def _scan_date(self, source: str, date: str) -> pl.LazyFrame:
         key = (source, date)
@@ -223,4 +238,15 @@ _FIXED_SOURCE_SCHEMAS = {
     "daily_k": _DAILY_K_SCHEMA,
     "snapshot_tbar": _SNAPSHOT_TBAR_SCHEMA,
     "universe/ex2kamt": _UNIVERSE_EX2KAMT_SCHEMA,
+}
+
+_TICK_TBAR_IDENTITY_KEYS = (*KEY_COLUMNS, "price", "side")
+
+_FIXED_SOURCE_IDENTITY_KEYS = {
+    "trades_tbar": _TICK_TBAR_IDENTITY_KEYS,
+    "cancels_tbar": _TICK_TBAR_IDENTITY_KEYS,
+    "quotes_tbar": _TICK_TBAR_IDENTITY_KEYS,
+    "daily_k": DAILY_KEY_COLUMNS,
+    "snapshot_tbar": KEY_COLUMNS,
+    "universe/ex2kamt": DAILY_KEY_COLUMNS,
 }

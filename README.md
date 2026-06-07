@@ -23,9 +23,10 @@ df = Engine(data_root="data").collect(model, dates=["20170103"])
 - `Node` 和 `Col` 支持 magic arithmetic：`+ - * /` 都会生成 `op` 节点。
 - `Where(Side("buy"))` / `Where(Side("sell"))` 是语义 side filter；执行时映射到当前数据中的 `side == 0/1`。
 - `Aggregate(frequency, agg, ...)` 统一处理 raw -> 1m、分钟 resample、daily agg 和 auction 逻辑。
+- `Grid(frequency=None, auction=None)` 显式把 raw/minute frame 对齐到 universe × minute grid；未传 `frequency` 时从 `grain_path` 推断，raw source 默认 1m，可直接作用于 `Source(...)`。
 - `Join()` 横向合并多个 frame，保留 public fields 和 internal payload。
 - `Project()` 显式丢弃 internal payload，只保留 key columns + public fields。
-- `FillNull(value)` 支持固定数值、`"ffill"` 和 `"state"`；`"state"` 使用 close_state 填 public field。
+- `FillNull(value)` 支持固定数值、`"ffill"` 和 `"state"`；`"state"` 使用 field 的 source lineage 和 aggregate path 构造同粒度 close_state，并对齐待填 frame 的 key 后填 public field。
 
 `Engine.collect()` 只接受日频 factor 输出：输出必须是 `(date, secu_code)` grain，并包含 public `value` column。分钟级结果请先显式 `Aggregate("1d", ..., alias="value")`，或直接用 `Engine.evaluate()` / `Engine.trace()` 查看。
 
@@ -34,6 +35,8 @@ Payload 的当前特性：
 
 - `FillNull()` 后再次 `Aggregate()` 时，filled public field 以填充后的列为准；保留下来的 payload 仍可用于 lineage/debug，但旧 components 不再表示可以完整重算 filled public field。
 - `Aggregate(apply_to="field")` 会直接聚合 public field，并把 payload 一起保留到目标粒度；保留下来的 payload 不承诺可以完整重算聚合后的 public field，主要表达来源和调试信息。
+
+`FillNull("state")` 要求字段有唯一 source lineage；多 source 表达式会显式报错，避免隐式选择某个 source 的 close_state。
 
 Public alias 和 `Join()` input name 不能以 `__` 开头，也不能使用 `date`、`secu_code`、`minute` 这些 key column 名。
 
@@ -44,7 +47,7 @@ Public alias 和 `Join()` input name 不能以 `__` 开头，也不能使用 `da
 更完整的 user guide 和 API reference 放在 [docs/index.md](docs/index.md)。文档按 sklearn / Polars 风格拆成 narrative guide 与 API reference 两层：
 
 - user guide 解释 source schema、aggregation、rolling、payload、debugging 等语义。
-- API reference 覆盖 `Engine`、`Model`、`Source`、`Metric`、`Op`、filters、`Aggregate`、`FillNull`、`Join` 和 `Project`。
+- API reference 覆盖 `Engine`、`Model`、`Source`、`Metric`、`Op`、filters、`Aggregate`、`Grid`、`FillNull`、`Join` 和 `Project`。
 
 文档站使用 MkDocs Material：
 
@@ -59,13 +62,15 @@ python -m mkdocs serve
 python -m mkdocs build
 ```
 
-## Frame Plan 约定
+## FrameInfo 约定
 
-每个 frame layer 都需要注册一个 frame plan。Plan 是该 layer 输出列布局的单一事实源，负责定义 `columns`、`keys`、`grain` 和 `FieldInfo`：
+运行期元数据收敛为 `FieldInfo` 和 `FrameInfo`。每个 frame layer 都需要注册 executor 和 info builder；执行所需的 layout/spec 由 helper 从 `FrameInfo` 派生，不再维护独立 `FramePlan` / `FrameSchema` / `FrameLineage`：
 
-- schema inference 统一由 plan 派生，不再由 executor 结果反推。
-- executor 的最终输出列应按 plan columns `select`，避免 schema 和真实输出漂移。
-- 新增 layer 时，需要同时注册 executor 和 plan；复杂 layer 可以在 plan 中附带额外执行规格，例如 aggregate 的 value/component/payload specs。
+- `FieldInfo` 记录单列的物理列名、public/payload/identity 角色、source lineage、operator components、`grain_path` 和 `lookback_days`。
+- `FrameInfo` 是一组 `FieldInfo`；`columns`、`identity_keys`、`grain`、public value columns 和 payload columns 都从字段信息推断。
+- schema inference 统一由 info builder 派生，不再由 executor 结果反推；executor 的最终输出列应按 `FrameInfo.columns` `select`，避免元数据和真实输出漂移。
+- `SourceCatalog` 负责注册 source 的固定 schema 和 row identity keys；`Aggregate` 等 `group_by` layer 会把输出 identity 改成 group keys。
+- `Grid` 是显式 left join 语义：左侧 grid identity 为 `(date, secu_code, minute)`，右侧必须包含这些列，输出 identity 是所有输入 identity keys 的有序并集；raw source 不会自动补 grid。
 
 ## Metric Recipes
 
@@ -84,7 +89,7 @@ python -m mkdocs build
 示例：
 
 ```python
-from draco_model.layers import Aggregate, Col, FillNull, Metric, Source
+from draco_model.layers import Aggregate, Col, FillNull, Grid, Metric, Source
 
 raw = Source("trades_tbar")
 
@@ -94,6 +99,10 @@ vwap = (amount / volume).alias("vwap")
 
 vwap_5m = Aggregate("5m", "sum", apply_to="components")(vwap)
 mean_minute_vwap = Aggregate("5m", "mean", apply_to="field")(vwap)
+gridded_raw = Grid()(raw)
+volume_grid = Grid()(volume)
+volume_5m_auto_grid = Grid()(Aggregate("5m", "sum", value_col="volume")(volume))
+volume_5m_grid = Grid("5m")(Aggregate("5m", "sum", value_col="volume")(volume))
 
 row_amount = (Col("price") * Col("volume")).alias("amount")(raw)
 preclose = FillNull("state")(Metric("preclose", raw))

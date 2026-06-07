@@ -9,7 +9,7 @@ import polars as pl
 from draco_model.core import Layer, Node
 from draco_model.layers.names import validate_public_alias
 from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
-from draco_model.runtime.execution import EvalContext, FieldInfo, FramePlan, FrameSchema, register_executor, register_plan
+from draco_model.runtime.execution import EvalContext, FieldInfo, FrameInfo, register_executor, register_info
 
 
 logger = logging.getLogger(__name__)
@@ -38,17 +38,17 @@ def _join(node: Node, context: EvalContext) -> pl.LazyFrame:
     intraday_frames = []
     daily_frames = []
     parent_schemas = {
-        input_name: context.infer_schema(parent)
+        input_name: context.infer_info(parent)
         for input_name, parent in node.inputs.items()
     }
-    plan = _join_plan_from_schemas(parent_schemas)
+    info = _join_info_from_inputs(parent_schemas)
     logger.debug(
         "join.start node_id=%s inputs=%s output_grain=%s keys=%s columns=%d",
         node.id,
         list(node.inputs),
-        plan.grain,
-        plan.keys,
-        len(plan.columns),
+        info.grain,
+        info.keys,
+        len(info.columns),
     )
     for input_name, parent in node.inputs.items():
         schema = parent_schemas[input_name]
@@ -72,16 +72,16 @@ def _join(node: Node, context: EvalContext) -> pl.LazyFrame:
         out = pl.concat(intraday_frames, how="align")
         for daily in daily_frames:
             out = out.join(daily, on=list(DAILY_KEY_COLUMNS), how="left")
-        return out.select(list(plan.columns))
-    return pl.concat(daily_frames, how="align").select(list(plan.columns))
+        return out.select(list(info.columns))
+    return pl.concat(daily_frames, how="align").select(list(info.columns))
 
 
-@register_plan("join")
-def _join_plan(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FramePlan:
-    return _join_plan_from_schemas(parent_schemas)
+@register_info("join")
+def _join_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalContext) -> FrameInfo:
+    return _join_info_from_inputs(parent_infos)
 
 
-def _join_plan_from_schemas(parent_schemas: dict[str, FrameSchema]) -> FramePlan:
+def _join_info_from_inputs(parent_schemas: dict[str, FrameInfo]) -> FrameInfo:
     has_intraday = any(schema.keys == KEY_COLUMNS for schema in parent_schemas.values())
     keys = KEY_COLUMNS if has_intraday else DAILY_KEY_COLUMNS
     columns = list(keys)
@@ -89,45 +89,53 @@ def _join_plan_from_schemas(parent_schemas: dict[str, FrameSchema]) -> FramePlan
     for input_name, schema in parent_schemas.items():
         renames = _renames(input_name, schema)
         columns.extend(renames.values())
-        for field_name, info in schema.fields.items():
-            output_name = renames.get(info.column, field_name)
+        for source, target in renames.items():
+            info = schema.fields.get(source, FieldInfo(source, source))
             component_renames = tuple(renames.get(component, component) for component in info.components)
-            fields[output_name] = replace(
+            fields[target] = replace(
                 info,
-                name=output_name,
-                column=output_name,
+                name=target if info.is_public else info.name,
+                column=target,
                 components=component_renames,
+                is_payload=target.startswith("__") or info.is_payload,
+                is_public=info.is_public and not target.startswith("__"),
+                identity_order=None,
             )
-    return FramePlan(columns=tuple(dict.fromkeys(columns)), keys=keys, grain="minute" if has_intraday else "daily", fields=fields)
+    return FrameInfo.from_columns(
+        tuple(dict.fromkeys(columns)),
+        identity_keys=keys,
+        fields=fields,
+    )
 
 
 @register_executor("project")
 def _project(node: Node, context: EvalContext) -> pl.LazyFrame:
     parent = node.inputs["input"]
-    schema = context.infer_schema(parent)
-    plan = _project_plan_from_schema(schema)
-    return context.evaluate(parent).select(list(plan.columns))
+    info = context.infer_info(parent)
+    output_info = _project_info_from_parent(info)
+    return context.evaluate(parent).select(list(output_info.columns))
 
 
-@register_plan("project")
-def _project_plan(node: Node, parent_schemas: dict[str, FrameSchema], context: EvalContext) -> FramePlan:
-    return _project_plan_from_schema(parent_schemas["input"])
+@register_info("project")
+def _project_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalContext) -> FrameInfo:
+    return _project_info_from_parent(parent_infos["input"])
 
 
-def _project_plan_from_schema(parent: FrameSchema) -> FramePlan:
+def _project_info_from_parent(parent: FrameInfo) -> FrameInfo:
+    columns = (*parent.keys, *parent.value_columns())
     fields = {
-        name: replace(info, components=(), component_agg=False)
-        for name, info in parent.fields.items()
+        column: replace(parent.fields[column], components=(), component_agg=False)
+        for column in columns
+        if column in parent.fields
     }
-    return FramePlan(
-        columns=(*parent.keys, *[info.column for info in fields.values()]),
-        keys=parent.keys,
-        grain=parent.grain,
+    return FrameInfo.from_columns(
+        columns,
+        identity_keys=parent.keys,
         fields=fields,
     )
 
 
-def _renames(input_name: str, schema: FrameSchema) -> dict[str, str]:
+def _renames(input_name: str, schema: FrameInfo) -> dict[str, str]:
     validate_public_alias(input_name, subject="Join input name")
     values = [column for column in schema.columns if column not in schema.keys]
     public = set(schema.value_columns())

@@ -102,8 +102,8 @@ class Condition:
     params: dict[str, Any]
 
     def to_node(self, frame: Node) -> Node:
-        """Attach this condition to the frame it will be evaluated against."""
-        return Node(kind="condition", op=self.op, params=dict(self.params), inputs={"frame": frame})
+        """Convert this condition to a pure condition node."""
+        return Node(kind="condition", op=self.op, params=dict(self.params))
 
 
 class Model:

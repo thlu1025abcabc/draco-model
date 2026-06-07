@@ -11,14 +11,14 @@ from draco_model.data.source import SourceCatalog
 from draco_model.data.trading_calendar import TradingCalendar
 from draco_model.data.universe import UniverseCatalog
 from draco_model.market.minute_calendar import MinuteCalendar
-from draco_model.market.schema import DAILY_KEY_COLUMNS
 from draco_model.runtime.execution import (
+    can_collect,
     EvalContext,
-    FrameSchema,
+    FrameInfo,
     TraceStep,
     format_factor_output,
     get_executor,
-    get_plan_builder,
+    get_info_builder,
 )
 
 
@@ -42,7 +42,8 @@ class Engine:
         self.universes = UniverseCatalog(self.data_root)
         self.trading_calendar = trading_calendar
         self._memory: dict[tuple[str, str, str], pl.LazyFrame] = {}
-        self._grid_memory: dict[tuple[str, str], pl.DataFrame] = {}
+        self._info_memo: dict[tuple[str, str, str], FrameInfo] = {}
+        self._grid_memory: dict[tuple[str, str, tuple[int, ...]], pl.DataFrame] = {}
 
     def collect(self, model: Model, dates: list[str] | tuple[str, ...]) -> pl.DataFrame:
         """Evaluate a model output for dates and collect daily factor rows."""
@@ -61,8 +62,8 @@ class Engine:
         for date in normalized_dates:
             logger.debug("collect.date.start model=%s date=%s", model.name, date)
             self._grid_memory.clear()
-            schema = self._infer_schema(model, model.output, date)
-            _validate_collect_schema(schema)
+            info = self._infer_info(model, model.output, date)
+            _validate_collect_info(info)
             frame = self.evaluate(model, model.output, date)
             outputs.append(format_factor_output(frame, model.name, date))
             logger.debug("collect.date.done model=%s date=%s", model.name, date)
@@ -121,7 +122,7 @@ class Engine:
                 minute_calendar=self.minute_calendar,
                 trading_calendar=self.trading_calendar,
                 evaluate=evaluate,
-                infer_schema=lambda parent: self._infer_schema(model, parent, eval_date),
+                infer_info=lambda parent: self._infer_info(model, parent, eval_date),
                 grid_cache=self._grid_memory,
             )
             frame = get_executor(node.op)(node, context).collect()
@@ -161,7 +162,7 @@ class Engine:
             minute_calendar=self.minute_calendar,
             trading_calendar=self.trading_calendar,
             evaluate=lambda parent: self._eval(model, parent, eval_date),
-            infer_schema=lambda parent: self._infer_schema(model, parent, eval_date),
+            infer_info=lambda parent: self._infer_info(model, parent, eval_date),
             grid_cache=self._grid_memory,
         )
         out = get_executor(node.op)(node, context)
@@ -169,9 +170,15 @@ class Engine:
         self._memory[key] = out
         return out
 
-    def _infer_schema(self, model: Model, node: Node, eval_date: str) -> FrameSchema:
-        parent_schemas = {
-            input_name: self._infer_schema(model, parent, eval_date)
+    def _infer_info(self, model: Model, node: Node, eval_date: str) -> FrameInfo:
+        key = (model.universe, node.id, eval_date)
+        if key in self._info_memo:
+            logger.debug("info.cache_hit universe=%s date=%s node_id=%s op=%s", model.universe, eval_date, node.id, node.op)
+            return self._info_memo[key]
+
+        logger.debug("info.cache_miss universe=%s date=%s node_id=%s op=%s", model.universe, eval_date, node.id, node.op)
+        parent_infos = {
+            input_name: self._infer_info(model, parent, eval_date)
             for input_name, parent in node.inputs.items()
             if parent.kind == "frame"
         }
@@ -184,24 +191,25 @@ class Engine:
             minute_calendar=self.minute_calendar,
             trading_calendar=self.trading_calendar,
             evaluate=lambda parent: self._eval(model, parent, eval_date),
-            infer_schema=lambda parent: self._infer_schema(model, parent, eval_date),
+            infer_info=lambda parent: self._infer_info(model, parent, eval_date),
             grid_cache=self._grid_memory,
         )
-        planner = get_plan_builder(node.op)
-        if planner is not None:
-            return planner(node, parent_schemas, context).schema()
-        return FrameSchema(tuple(self._eval(model, node, eval_date).collect_schema().names()))
+        builder = get_info_builder(node.op)
+        if builder is not None:
+            info = builder(node, parent_infos, context)
+        else:
+            info = FrameInfo.from_columns(tuple(self._eval(model, node, eval_date).collect_schema().names()))
+        self._info_memo[key] = info
+        return info
 
 
 def _normalize_date(value: object) -> str:
     return str(value).replace("-", "")
 
 
-def _validate_collect_schema(schema: FrameSchema) -> None:
-    if schema.keys != DAILY_KEY_COLUMNS or schema.grain != "daily":
+def _validate_collect_info(info: FrameInfo) -> None:
+    if not can_collect(info):
         raise ValueError(
             "Engine.collect requires a daily output with date/secu_code keys; "
-            f"got grain={schema.grain!r}, keys={schema.keys!r}."
+            f"got grain={info.grain!r}, keys={info.keys!r}."
         )
-    if "value" not in schema.value_columns():
-        raise ValueError("Engine.collect requires a public 'value' column.")
