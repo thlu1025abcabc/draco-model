@@ -41,7 +41,7 @@ Node(
 )
 ```
 
-Immutable DAG node used by layers, conditions, and model outputs.
+Immutable DAG node used by layers and model outputs.
 
 `id` is structural and deterministic. `name` is display metadata used by trace and Mermaid rendering; it does not participate in the structural id.
 

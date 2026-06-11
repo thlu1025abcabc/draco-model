@@ -40,9 +40,9 @@ Daily aggregation applies the auction policy before daily grouping.
 
 ## `apply_to`
 
-`apply_to="field"` aggregates the public field directly and retains payload for lineage/debugging.
+`apply_to="field"` aggregates the public field directly and drops payload by applying the public projection after aggregation.
 
-`apply_to="components"` aggregates operator components separately, then recomputes the public output. This is important for ratio-like fields such as vwap:
+`apply_to="components"` aggregates operator components separately, then recomputes the public output. This requires aggregatable components and is not available after `FillNull()`. It is important for ratio-like fields such as vwap:
 
 ```python
 amount = Metric("amount", raw)

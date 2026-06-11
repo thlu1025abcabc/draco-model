@@ -23,20 +23,22 @@ df = Engine(data_root="data").collect(model, dates=["20170103"])
 - `Node` 和 `Col` 支持 magic arithmetic：`+ - * /` 都会生成 `op` 节点。
 - `Where(Side("buy"))` / `Where(Side("sell"))` 是语义 side filter；执行时映射到当前数据中的 `side == 0/1`。
 - `Aggregate(frequency, agg, ...)` 统一处理 raw -> 1m、分钟 resample、daily agg 和 auction 逻辑。
-- `Grid(frequency=None, auction=None)` 显式把 raw/minute frame 对齐到 universe × minute grid；未传 `frequency` 时从 `grain_path` 推断，raw source 默认 1m，可直接作用于 `Source(...)`。
-- `Join()` 横向合并多个 frame，保留 public fields 和 internal payload。
+- `Grid(frequency=None, auction=None)` 显式把 frame 对齐到 universe × minute grid；minute/raw frame 按 `(date, secu_code, minute)` 对齐，daily frame 按 `(date, secu_code)` broadcast 到分钟 grid。
+- `Join(how="full")` 用 SQL full join 横向对齐多个 frame；`Join(how="left", on=...)` 按显式 key 做 left join；显式 `on` 必须覆盖两个输入共享的 identity keys，避免漏掉 `price/side` 这类 key 后产生笛卡尔扇出。`how="full"` 不允许混合 daily identity frame 与 minute/raw frame；混合粒度请显式使用 `Join(how="left", on=("date", "secu_code"))`。两者输出 identity 都是所有输入 identity keys 的有序并集。
 - `Project()` 显式丢弃 internal payload，只保留 key columns + public fields。
-- `FillNull(value)` 支持固定数值、`"ffill"` 和 `"state"`；`"state"` 使用 field 的 source lineage 和 aggregate path 构造同粒度 close_state，并对齐待填 frame 的 key 后填 public field。
+- `FillNull(value)` 支持固定数值、`"ffill"` 和 `"state"`；`"state"` 使用 field 的 `FieldInfo.source` 和 `grain_path` 构造同粒度 close_state，并对齐待填 frame 的 key 后填 public field。`FillNull()` 后会丢弃 old payload。
+
+使用建议：`Source(...)` 不会自动补 grid，但如果 raw/minute source 后续要和 daily feature 或其他粒度横向组合，优先显式套一层 `Grid()`。这样下游节点都落在统一的 `(date, secu_code, minute)` grid 上，能减少 mixed-grain `Join()` 的歧义。
 
 `Engine.collect()` 只接受日频 factor 输出：输出必须是 `(date, secu_code)` grain，并包含 public `value` column。分钟级结果请先显式 `Aggregate("1d", ..., alias="value")`，或直接用 `Engine.evaluate()` / `Engine.trace()` 查看。
 
-除非显式运行 `Project()`，其他 layer 都会保留 internal payload。聚合类 layer 会把 payload 聚合到目标粒度；`FillNull()` 会保留 payload 列，但填充后的 public field 不再把旧 payload 标记为可重算 components。
+除非显式运行 `Project()`，其他 layer 默认保留 internal payload；`Aggregate(apply_to="field")` 和 `FillNull()` 是例外，它们会在计算后自动投影到 key columns + public fields。
 Payload 的当前特性：
 
-- `FillNull()` 后再次 `Aggregate()` 时，filled public field 以填充后的列为准；保留下来的 payload 仍可用于 lineage/debug，但旧 components 不再表示可以完整重算 filled public field。
-- `Aggregate(apply_to="field")` 会直接聚合 public field，并把 payload 一起保留到目标粒度；保留下来的 payload 不承诺可以完整重算聚合后的 public field，主要表达来源和调试信息。
+- `FillNull()` 后旧 payload 会被丢弃；这表示 filled public field 不再支持 `Aggregate(apply_to="components")`，后续如需聚合请使用 `apply_to="field"`。
+- `Aggregate(apply_to="field")` 会直接聚合 public field，并在聚合后自动丢弃 payload。
 
-`FillNull("state")` 要求字段有唯一 source lineage；多 source 表达式会显式报错，避免隐式选择某个 source 的 close_state。
+`FillNull("state")` 要求字段有唯一 `FieldInfo.source`；多 source 表达式会显式报错，避免隐式选择某个 source 的 close_state。
 
 Public alias 和 `Join()` input name 不能以 `__` 开头，也不能使用 `date`、`secu_code`、`minute` 这些 key column 名。
 
@@ -64,13 +66,13 @@ python -m mkdocs build
 
 ## FrameInfo 约定
 
-运行期元数据收敛为 `FieldInfo` 和 `FrameInfo`。每个 frame layer 都需要注册 executor 和 info builder；执行所需的 layout/spec 由 helper 从 `FrameInfo` 派生，不再维护独立 `FramePlan` / `FrameSchema` / `FrameLineage`：
+运行期元数据收敛为 `FieldInfo` 和 `FrameInfo`。每个 frame layer 都需要注册 executor 和 info builder；执行所需的 layout/spec 由 helper 从 `FrameInfo` 派生，不再维护独立的 plan/schema/source-tracking class：
 
-- `FieldInfo` 记录单列的物理列名、public/payload/identity 角色、source lineage、operator components、`grain_path` 和 `lookback_days`。
+- `FieldInfo` 记录单列的物理列名、public/payload/identity 角色、`source`、operator components、`grain_path` 和 `lookback_days`。
 - `FrameInfo` 是一组 `FieldInfo`；`columns`、`identity_keys`、`grain`、public value columns 和 payload columns 都从字段信息推断。
 - schema inference 统一由 info builder 派生，不再由 executor 结果反推；executor 的最终输出列应按 `FrameInfo.columns` `select`，避免元数据和真实输出漂移。
 - `SourceCatalog` 负责注册 source 的固定 schema 和 row identity keys；`Aggregate` 等 `group_by` layer 会把输出 identity 改成 group keys。
-- `Grid` 是显式 left join 语义：左侧 grid identity 为 `(date, secu_code, minute)`，右侧必须包含这些列，输出 identity 是所有输入 identity keys 的有序并集；raw source 不会自动补 grid。
+- `Join(how="full")` 在 `on=None` 时逐步使用左右 identity keys 的交集；`Join(how="left")` 在 `on=None` 时以最左输入的 identity keys 为 join key。显式 `on` 时按 `on` join，但 `on` 必须是双方 identity key 且覆盖双方共享 identity；输出 identity 都是所有输入 identity keys 的有序并集。`how="full"` 只允许同粒度或全 daily 输入，不允许 daily/minute 混合产生 `minute=null` padding row；混合粒度请使用 `how="left"` 并显式选择 join key。`Grid` 是 system grid source 加 `Join(how="left")` 的 API 应用；raw source 不会自动补 grid，但对 source 显式 `Grid()` 后，下游 feature 会共享统一 minute identity，后续 join 通常更简单。
 
 ## Metric Recipes
 
@@ -89,9 +91,10 @@ python -m mkdocs build
 示例：
 
 ```python
-from draco_model.layers import Aggregate, Col, FillNull, Grid, Metric, Source
+from draco_model.layers import Aggregate, Col, FillNull, Grid, Join, Metric, Source
 
 raw = Source("trades_tbar")
+gridded_raw = Grid()(raw)
 
 amount = Metric("amount", raw)
 volume = Metric("volume", raw)
@@ -99,10 +102,15 @@ vwap = (amount / volume).alias("vwap")
 
 vwap_5m = Aggregate("5m", "sum", apply_to="components")(vwap)
 mean_minute_vwap = Aggregate("5m", "mean", apply_to="field")(vwap)
-gridded_raw = Grid()(raw)
+grid_volume = Metric("volume", gridded_raw)
 volume_grid = Grid()(volume)
 volume_5m_auto_grid = Grid()(Aggregate("5m", "sum", value_col="volume")(volume))
 volume_5m_grid = Grid("5m")(Aggregate("5m", "sum", value_col="volume")(volume))
+daily_vwap = Aggregate("1d", "mean", value_col="vwap", alias="daily_vwap")(vwap)
+features = Join(how="left", on=("date", "secu_code"))({
+    "minute_volume": grid_volume,
+    "daily": daily_vwap,
+})
 
 row_amount = (Col("price") * Col("volume")).alias("amount")(raw)
 preclose = FillNull("state")(Metric("preclose", raw))
@@ -134,8 +142,16 @@ cross_day_corr = Op("rolling_corr", amount, volume, window=5, alias="corr_5_cros
 - `frequency="1d"` / `"daily"`：按 `(date, secu_code)` 聚合。
 - `auction="drop"` 删除 auction minutes。
 - `auction="merge"` 先把 auction minutes 合入当前目标频率中除 auction 外的第一根/最后一根 bar，再执行聚合；例如 1m 为 `925 -> 930`、`1500 -> 1456`，5m 为 `925 -> 930`、`1500 -> 1455`。Daily aggregate 也会先应用 `auction` 策略，再按日聚合。
-- `apply_to="field"` 直接聚合 public output，同时保留 payload。
+- `apply_to="field"` 直接聚合 public output，然后自动丢弃 payload。
 - `apply_to="components"` 对 operator components 分别聚合，再按原 operator 重算 public output。
+- 如果 `value_col` 本身是 identity key，例如 raw source 的 `minute` / `price` / `side`，必须提供非 key 的 `alias`，避免输出 public value 与 identity column 同名。
+
+注意：daily aggregate 的 `auction="merge"` 会在合并 auction bar 和最终 daily 聚合时使用同一个 `agg`。例如 `Aggregate("1d", "mean", auction="merge")` 会先用 `mean` 合并 `925 -> 930` / `1500 -> 1456` 后的同一分钟，再对全天做 `mean`。如果目标语义是“auction volume 先用 `sum` 合入非 auction bar，然后再做 daily `mean`”，需要显式拆成两层：
+
+```python
+volume_1m = Aggregate("1m", "sum", value_col="volume", auction="merge")(Metric("volume", raw))
+daily_mean = Aggregate("1d", "mean", value_col="volume", alias="value")(volume_1m)
+```
 
 `sum` 使用 null-safe sum：如果一个 group 全是 null，结果保持 null，不会被 Polars 默认 sum 写成 0。
 
@@ -199,6 +215,3 @@ python -m examples.preclose_fill_state_demo
 - 后续 batch planner 需要合并多个 model / metric 中可复用的 source scan、operator branch 和 join。
 - 后续 optimizer 可以把同 source 的 `Metric("amount")`、`Metric("volume")`、`Metric("vwap")` fuse 成更少的 physical plan。
 - 评估是否需要 smart join：根据输入 grain、key 覆盖、source 复用和 public/payload 列需求，减少不必要的宽表 join、重复 scan 或中间 payload 搬运。
-- 继续思考 `close_state` 是否也进入 payload / operator metadata 体系。
-- 再次整体评估 payload 是否应该默认保留：需要决定 payload 是继续作为跨 layer 的物理列传播，还是改为只在需要 trace/debug/组件重算时保留，或者在部分 layer 后默认 drop。
-- 重新设计 `Aggregate(apply_to="field")` 的 payload 处理：当前 payload 会被同一个 `agg` 聚合后保留，但这可能产生误导性的 lineage/debug 信息，后续需要决定是 drop、仅保留 metadata，还是为 payload 定义独立聚合策略。

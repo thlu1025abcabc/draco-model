@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 @dataclass(frozen=True)
 class Node:
-    """Immutable DAG node used by layers, conditions, and model outputs."""
+    """Immutable DAG node used by layers and model outputs."""
 
     kind: str
     op: str
@@ -92,18 +92,6 @@ class Layer:
             inputs=_normalize_inputs(inputs),
             name=self.name,
         )
-
-
-@dataclass(frozen=True)
-class Condition:
-    """Boolean expression descriptor used by filtering layers."""
-
-    op: str
-    params: dict[str, Any]
-
-    def to_node(self, frame: Node) -> Node:
-        """Convert this condition to a pure condition node."""
-        return Node(kind="condition", op=self.op, params=dict(self.params))
 
 
 class Model:

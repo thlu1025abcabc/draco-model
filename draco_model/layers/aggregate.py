@@ -64,6 +64,20 @@ class Aggregate(Layer):
             auction=None if auction == "keep" else auction,
         )
 
+    def __call__(self, frame: Node) -> Node:
+        aggregate = Node(
+            kind=self.output_kind,
+            op=self.op,
+            params=dict(self.params),
+            inputs={"input": frame},
+            name=None if self.params.get("apply_to", APPLY_TO_FIELD) == APPLY_TO_FIELD else self.name,
+        )
+        if self.params.get("apply_to", APPLY_TO_FIELD) == APPLY_TO_FIELD:
+            from draco_model.layers.combine import Project
+
+            return Project(name=self.name)(aggregate)
+        return aggregate
+
 
 @register_executor("aggregate")
 def _aggregate(node: Node, context: EvalContext) -> pl.LazyFrame:
@@ -254,16 +268,27 @@ def _aggregate_specs_from_info(
     for column in values:
         info = _field_for_column(parent, column)
         output = str(alias) if alias is not None else column
+        if output in {*parent.keys, *keys}:
+            raise ValueError(
+                f"Aggregate output column {output!r} conflicts with identity columns; "
+                "pass alias=... to store it as a public value."
+            )
         columns.append(output)
         components: tuple[str, ...] = ()
         operator = "identity"
         component_agg = False
-        if apply_to == APPLY_TO_COMPONENTS and info.component_agg and info.components:
-            components = tuple(f"__op_{output}_{idx}" for idx, _ in enumerate(info.components))
-            columns.extend(components)
-            operator = info.operator
-            component_agg = True
-            consumed_component_payloads.update(info.components)
+        if apply_to == APPLY_TO_COMPONENTS:
+            if info.operator == "fill_null":
+                raise ValueError(
+                    "Aggregate(apply_to='components') is not supported after FillNull(); "
+                    "use apply_to='field' for filled fields."
+                )
+            if info.component_agg and info.components:
+                components = tuple(f"__op_{output}_{idx}" for idx, _ in enumerate(info.components))
+                columns.extend(components)
+                operator = info.operator
+                component_agg = True
+                consumed_component_payloads.update(info.components)
         fields[output] = FieldInfo(
             name=output,
             column=output,

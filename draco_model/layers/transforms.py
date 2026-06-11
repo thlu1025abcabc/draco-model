@@ -10,7 +10,6 @@ from draco_model.layers.aggregate import parse_minute_frequency
 from draco_model.market.minute_calendar import AUCTION_MINUTES
 from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
 from draco_model.runtime.execution import (
-    can_grid,
     EvalContext,
     FieldInfo,
     FrameInfo,
@@ -24,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class Grid(Layer):
-    """Align a raw or minute-grain frame to an explicit universe-by-minute grid."""
+    """Align a frame to an explicit universe-by-minute grid."""
 
     op = "grid"
 
@@ -41,6 +40,13 @@ class Grid(Layer):
             raise ValueError("Grid auction must be 'keep', 'drop', or 'merge'.")
         super().__init__(name=name, frequency=frequency, auction=auction)
 
+    def __call__(self, frame: Node) -> Node:
+        from draco_model.layers.combine import IDENTITY_INTERSECTION, Join
+
+        grid = Node(kind="frame", op="_grid_source", params=dict(self.params), inputs={"input": frame})
+        joined = Join(how="left", on=IDENTITY_INTERSECTION)({"grid": grid, "input": frame})
+        return Node(kind="frame", op="_grid_project", inputs={"join": joined, "input": frame}, name=self.name)
+
 
 class FillNull(Layer):
     """Fill nulls in a single public field."""
@@ -51,16 +57,18 @@ class FillNull(Layer):
         super().__init__(name=name, value=value)
 
     def __call__(self, frame: Node) -> Node:
-        return Node(kind="frame", op=self.op, params=dict(self.params), inputs={"input": frame}, name=self.name)
+        fill = Node(kind="frame", op=self.op, params=dict(self.params), inputs={"input": frame})
+        from draco_model.layers.combine import Project
+
+        return Project(name=self.name)(fill)
 
 
-@register_executor("grid")
-def _grid(node: Node, context: EvalContext) -> pl.LazyFrame:
+@register_executor("_grid_source")
+def _grid_source(node: Node, context: EvalContext) -> pl.LazyFrame:
     parent = node.inputs["input"]
     schema = context.infer_info(parent)
-    info = _grid_info_from_parent(schema)
     frequency, auction = _grid_policy(node, schema)
-    dates = context.trading_calendar.previous_sessions(context.eval_date, _grid_lookback(parent, schema))
+    dates = context.trading_calendar.previous_sessions(context.eval_date, _grid_lookback(schema))
     minutes = _grid_minutes(context, frequency, auction)
     logger.debug(
         "grid.start node_id=%s frequency=%s auction=%s dates=%s minutes=%d",
@@ -70,25 +78,58 @@ def _grid(node: Node, context: EvalContext) -> pl.LazyFrame:
         dates,
         len(minutes),
     )
-    grid = context.intraday_grid(context.model.universe, dates, minutes)
-    return (
-        grid.join(context.evaluate(parent), on=list(KEY_COLUMNS), how="left")
-        .select(list(info.columns))
-        .sort(list(KEY_COLUMNS))
-    )
+    return context.intraday_grid(context.model.universe, dates, minutes).sort(list(KEY_COLUMNS))
 
 
-@register_info("grid")
-def _grid_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalContext) -> FrameInfo:
-    return _grid_info_from_parent(parent_infos["input"])
+@register_info("_grid_source")
+def _grid_source_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalContext) -> FrameInfo:
+    return FrameInfo.from_columns(KEY_COLUMNS, identity_keys=KEY_COLUMNS)
 
 
-def _grid_info_from_parent(parent: FrameInfo) -> FrameInfo:
-    if not can_grid(parent):
-        raise ValueError("Grid requires a raw or minute frame with date/secu_code/minute keys.")
+@register_executor("_grid_project")
+def _grid_project(node: Node, context: EvalContext) -> pl.LazyFrame:
+    parent_info = context.infer_info(node.inputs["input"])
+    output_info = _grid_project_info_from_parent(parent_info)
+    renames = _grid_parent_renames(parent_info)
+    exprs = [
+        pl.col(column) if column in output_info.keys else pl.col(renames[column]).alias(column)
+        for column in output_info.columns
+    ]
+    return context.evaluate(node.inputs["join"]).select(exprs)
+
+
+@register_info("_grid_project")
+def _grid_project_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalContext) -> FrameInfo:
+    return _grid_project_info_from_parent(parent_infos["input"])
+
+
+def _grid_project_info_from_parent(parent: FrameInfo) -> FrameInfo:
     grid_info = FrameInfo.from_columns(KEY_COLUMNS, identity_keys=KEY_COLUMNS)
-    identity_keys = left_join_identity(grid_info, parent)
-    return FrameInfo.from_columns(parent.columns, identity_keys=identity_keys, fields=parent.fields)
+    identity_keys = left_join_identity(grid_info, parent, on=_grid_join_on(parent))
+    columns = _grid_output_columns(parent, identity_keys)
+    return FrameInfo.from_columns(columns, identity_keys=identity_keys, fields=parent.fields)
+
+
+def _grid_join_on(parent: FrameInfo) -> tuple[str, ...]:
+    if all(column in parent.keys for column in KEY_COLUMNS):
+        return KEY_COLUMNS
+    if all(column in parent.keys for column in DAILY_KEY_COLUMNS):
+        return DAILY_KEY_COLUMNS
+    raise ValueError("Grid requires date/secu_code keys, optionally with minute.")
+
+
+def _grid_output_columns(parent: FrameInfo, identity_keys: tuple[str, ...]) -> tuple[str, ...]:
+    values = tuple(column for column in parent.columns if column not in parent.keys)
+    conflicts = [column for column in values if column in identity_keys]
+    if conflicts:
+        raise ValueError(f"Grid output identity columns conflict with value columns: {conflicts}.")
+    return (*identity_keys, *values)
+
+
+def _grid_parent_renames(parent: FrameInfo) -> dict[str, str]:
+    from draco_model.layers.combine import _renames
+
+    return _renames("input", parent)
 
 
 @register_executor("fill_null")
@@ -146,7 +187,7 @@ def _fill_null_info_from_parent(parent: FrameInfo) -> FrameInfo:
     value_col = _single_value_column(parent)
     info = _field_for_column(parent, value_col)
     fields = dict(parent.fields)
-    fields[value_col] = replace(info, name=value_col, column=value_col, components=(), component_agg=False)
+    fields[value_col] = replace(info, name=value_col, column=value_col, operator="fill_null", components=(), component_agg=False)
     return FrameInfo.from_columns(
         parent.columns,
         identity_keys=parent.keys,
@@ -162,10 +203,10 @@ def _close_state_from_node(
     align_keys: pl.LazyFrame | None = None,
 ) -> pl.LazyFrame:
     if info.source is None:
-        raise ValueError("FillNull('state') requires source lineage.")
+        raise ValueError("FillNull('state') requires FieldInfo.source.")
     close_node = _build_close_state_subtree(info.source, info.lookback_days, info.grain_path)
     logger.debug(
-        "close_state.build_from_lineage node_id=%s source=%s lookback_days=%d grain_steps=%d",
+        "close_state.build_from_field_info node_id=%s source=%s lookback_days=%d grain_steps=%d",
         node.id,
         info.source,
         info.lookback_days,
@@ -287,9 +328,7 @@ def _grid_minutes(context: EvalContext, frequency: str, auction: str) -> tuple[i
     return tuple(minutes)
 
 
-def _grid_lookback(parent: Node, schema: FrameInfo) -> int:
-    if parent.op == "source":
-        return int(parent.params.get("lookback_days", 1))
+def _grid_lookback(schema: FrameInfo) -> int:
     values = [info.lookback_days for info in schema.fields.values()]
     return max(values) if values else 1
 

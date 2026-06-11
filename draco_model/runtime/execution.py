@@ -107,7 +107,7 @@ class FrameInfo:
 
     @property
     def grain(self) -> str:
-        """Return a coarse debug label inferred from row identity and field lineage."""
+        """Return a coarse debug label inferred from row identity and field metadata."""
         return infer_grain_label(self)
 
     def value_columns(self) -> list[str]:
@@ -147,11 +147,6 @@ def can_collect(info: FrameInfo) -> bool:
     return info.identity_keys == DAILY_KEY_COLUMNS and "value" in info.value_columns()
 
 
-def can_grid(info: FrameInfo) -> bool:
-    """Return whether a frame has intraday keys needed for grid alignment."""
-    return all(column in info.columns for column in KEY_COLUMNS)
-
-
 def ordered_union(*groups: tuple[str, ...]) -> tuple[str, ...]:
     """Return first-seen ordered union of column groups."""
     out: list[str] = []
@@ -164,14 +159,55 @@ def ordered_union(*groups: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(out)
 
 
-def left_join_identity(left: FrameInfo, *rights: FrameInfo) -> tuple[str, ...]:
+def resolve_identity_join_on(
+    left_identity: tuple[str, ...],
+    right_identity: tuple[str, ...],
+    on: tuple[str, ...] | None,
+    *,
+    how: str,
+    default: str = "intersection",
+) -> tuple[str, ...]:
+    """Return a validated join key for two identity contracts."""
+    if default not in {"intersection", "left"}:
+        raise ValueError("Join default must be 'intersection' or 'left'.")
+    if on is None:
+        if default == "left":
+            join_on = left_identity
+        else:
+            right_set = set(right_identity)
+            join_on = tuple(column for column in left_identity if column in right_set)
+    else:
+        join_on = tuple(on)
+    if not join_on:
+        raise ValueError(f"Join how={how!r} requires at least one shared identity key or explicit on.")
+
+    missing_left = [column for column in join_on if column not in left_identity]
+    missing_right = [column for column in join_on if column not in right_identity]
+    if missing_left or missing_right:
+        raise ValueError(
+            f"Join how={how!r} on columns must be identity columns in both inputs; "
+            f"missing_left={missing_left}, missing_right={missing_right}."
+        )
+
+    join_on_set = set(join_on)
+    right_set = set(right_identity)
+    missing_shared = [column for column in left_identity if column in right_set and column not in join_on_set]
+    if missing_shared:
+        raise ValueError(
+            f"Join how={how!r} on columns must include shared identity columns; "
+            f"missing_shared={missing_shared}."
+        )
+    return join_on
+
+
+def left_join_identity(left: FrameInfo, *rights: FrameInfo, on: tuple[str, ...] | None = None) -> tuple[str, ...]:
     """Return output identity for a left join anchored by the left identity."""
-    join_on = left.identity_keys
+    join_on = left.identity_keys if on is None else tuple(on)
+    identity = left.identity_keys
     for right in rights:
-        missing = [column for column in join_on if column not in right.columns]
-        if missing:
-            raise ValueError(f"Left join right input is missing left identity columns: {missing}.")
-    return ordered_union(join_on, *(right.identity_keys for right in rights))
+        resolve_identity_join_on(identity, right.identity_keys, join_on, how="left")
+        identity = ordered_union(identity, right.identity_keys)
+    return identity
 
 
 @dataclass(frozen=True)

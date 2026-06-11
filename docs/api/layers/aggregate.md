@@ -40,7 +40,9 @@ out = Aggregate("1d", "last", value_col="close", alias="value")(close)
 - `sum` is null-safe: all-null groups remain null.
 - `auction="merge"` maps auction minutes to the first and last non-auction target bars.
 - Daily aggregation applies auction handling before daily grouping.
-- `apply_to="components"` is appropriate for ratio-like fields whose numerator and denominator should be aggregated before recomputing the ratio.
+- `apply_to="field"` aggregates public fields directly, then applies public projection so payload columns are dropped.
+- `apply_to="components"` is appropriate for ratio-like fields whose numerator and denominator should be aggregated before recomputing the ratio. It is not supported after `FillNull()`; filled fields should use `apply_to="field"`.
+- If `value_col` is an identity column, pass a non-key `alias`; aggregate outputs cannot reuse identity column names as public values.
 
 ## Raises
 
@@ -49,3 +51,4 @@ out = Aggregate("1d", "last", value_col="close", alias="value")(close)
 | `ValueError` | `apply_to` is not `"field"` or `"components"`. |
 | `ValueError` | `auction` is not `"keep"`, `"drop"`, or `"merge"`. |
 | `ValueError` | `alias` is used while aggregating multiple value columns. |
+| `ValueError` | The output column would conflict with an identity column name. |

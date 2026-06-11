@@ -1,27 +1,39 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import polars as pl
 
-from draco_model.core import Condition, Layer, Node
+from draco_model.core import Layer, Node
 from draco_model.runtime.execution import EvalContext, FrameInfo, register_executor, register_info
 
 
-ConditionExpression = Callable[[Node], pl.Expr]
+@dataclass(frozen=True)
+class FilterSpec:
+    """Boolean expression descriptor used by Where."""
 
-_CONDITIONS: dict[str, ConditionExpression] = {}
+    op: str
+    params: dict[str, Any]
+
+    def to_params(self) -> dict[str, Any]:
+        return {"op": self.op, "params": dict(self.params)}
 
 
-def _register_condition(op: str) -> Callable[[ConditionExpression], ConditionExpression]:
-    def decorator(condition: ConditionExpression) -> ConditionExpression:
-        _CONDITIONS[op] = condition
-        return condition
+FilterExpression = Callable[[dict[str, Any]], pl.Expr]
+
+_FILTERS: dict[str, FilterExpression] = {}
+
+
+def _register_filter(op: str) -> Callable[[FilterExpression], FilterExpression]:
+    def decorator(filter_expr: FilterExpression) -> FilterExpression:
+        _FILTERS[op] = filter_expr
+        return filter_expr
 
     return decorator
 
 
-class Side(Condition):
+class Side(FilterSpec):
     """Semantic side condition."""
 
     def __init__(self, side: str) -> None:
@@ -30,14 +42,14 @@ class Side(Condition):
         super().__init__("side", {"side": side})
 
 
-class Flag(Condition):
+class Flag(FilterSpec):
     """Boolean column condition, used by metric recipes."""
 
     def __init__(self, column: str) -> None:
         super().__init__("flag", {"column": column})
 
 
-class Threshold(Condition):
+class Threshold(FilterSpec):
     """Compare one column with a literal threshold value."""
 
     def __init__(self, column: str, *, op: str = ">", value: Any) -> None:
@@ -46,7 +58,7 @@ class Threshold(Condition):
         super().__init__("threshold", {"column": column, "op": op, "value": value})
 
 
-class TopQuantile(Condition):
+class TopQuantile(FilterSpec):
     """Keep rows whose column value is at or above a group quantile."""
 
     def __init__(self, column: str, *, q: float, over: list[str] | tuple[str, ...]) -> None:
@@ -56,11 +68,11 @@ class TopQuantile(Condition):
 
 
 class Where(Layer):
-    """Filter a frame with a condition node."""
+    """Filter a frame with a filter condition."""
 
     op = "where"
 
-    def __init__(self, condition: Condition, *, name: str | None = None) -> None:
+    def __init__(self, condition: FilterSpec, *, name: str | None = None) -> None:
         super().__init__(name=name)
         self.condition = condition
 
@@ -68,14 +80,15 @@ class Where(Layer):
         return Node(
             kind="frame",
             op=self.op,
-            inputs={"frame": frame, "condition": self.condition.to_node(frame)},
+            params={"condition": self.condition.to_params()},
+            inputs={"frame": frame},
             name=self.name,
         )
 
 
 @register_executor("where")
 def _where(node: Node, context: EvalContext) -> pl.LazyFrame:
-    return context.evaluate(node.inputs["frame"]).filter(_condition_expr(node.inputs["condition"]))
+    return context.evaluate(node.inputs["frame"]).filter(_condition_expr(dict(node.params["condition"])))
 
 
 @register_info("where")
@@ -83,28 +96,28 @@ def _where_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalCon
     return parent_infos["frame"]
 
 
-def _condition_expr(node: Node) -> pl.Expr:
+def _condition_expr(condition: dict[str, Any]) -> pl.Expr:
+    op = str(condition["op"])
     try:
-        return _CONDITIONS[node.op](node)
+        return _FILTERS[op](dict(condition["params"]))
     except KeyError:
-        raise ValueError(f"Unsupported condition {node.op!r}.") from None
+        raise ValueError(f"Unsupported condition {op!r}.") from None
 
 
-@_register_condition("side")
-def _side_expr(node: Node) -> pl.Expr:
-    side = str(node.params["side"])
+@_register_filter("side")
+def _side_expr(params: dict[str, Any]) -> pl.Expr:
+    side = str(params["side"])
     code = {"buy": 0, "sell": 1}[side]
     return pl.col("side") == code
 
 
-@_register_condition("flag")
-def _flag_expr(node: Node) -> pl.Expr:
-    return pl.col(str(node.params["column"])).fill_null(False)
+@_register_filter("flag")
+def _flag_expr(params: dict[str, Any]) -> pl.Expr:
+    return pl.col(str(params["column"])).fill_null(False)
 
 
-@_register_condition("threshold")
-def _threshold_expr(node: Node) -> pl.Expr:
-    params = node.params
+@_register_filter("threshold")
+def _threshold_expr(params: dict[str, Any]) -> pl.Expr:
     col = pl.col(str(params["column"]))
     value = params["value"]
     op = str(params["op"])
@@ -123,9 +136,8 @@ def _threshold_expr(node: Node) -> pl.Expr:
     raise ValueError(f"Unsupported threshold op {op!r}.")
 
 
-@_register_condition("top_quantile")
-def _top_quantile_expr(node: Node) -> pl.Expr:
-    params = node.params
+@_register_filter("top_quantile")
+def _top_quantile_expr(params: dict[str, Any]) -> pl.Expr:
     column = str(params["column"])
     over = list(params["over"])
     threshold = pl.col(column).quantile(float(params["q"])).over(over)

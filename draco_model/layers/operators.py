@@ -152,7 +152,7 @@ def _column_info_from_parent(node: Node, parent: FrameInfo) -> FrameInfo:
     alias = str(node.params["alias"])
     _require_columns(list(parent.columns), [column])
     columns = _append_column(parent.columns, alias)
-    source, lookback, grain_path = _lineage_for_column(parent, column)
+    source, lookback, grain_path = _source_context_for_column(parent, column)
     return FrameInfo.from_columns(
         columns,
         identity_keys=parent.keys,
@@ -182,7 +182,7 @@ def _op_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalContex
     if mode == "row":
         parent = parent_infos["input"]
         alias = str(node.params["alias"])
-        source, lookback, grain_path = _lineage_from_schema(parent)
+        source, lookback, grain_path = _source_context_from_schema(parent)
         return FrameInfo.from_columns(
             _append_column(parent.columns, alias),
             identity_keys=parent.keys,
@@ -216,7 +216,7 @@ def _op_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalContex
         if input_name.startswith("operand")
         for renamed in _payload_renames(input_name, schema).values()
     )
-    source, lookback, grain_path = _common_lineage(input_schemas)
+    source, lookback, grain_path = _common_source_context(input_schemas)
     columns = (*keys, alias, *components, *payloads)
     fields: dict[str, FieldInfo] = {
         alias: FieldInfo(
@@ -502,45 +502,45 @@ def _payload_renames(input_name: str, schema: FrameInfo) -> dict[str, str]:
 def _field_info_for_column(schema: FrameInfo, column: str) -> FieldInfo:
     if column in schema.fields:
         return schema.fields[column]
-    source, lookback, grain_path = _lineage_for_column(schema, column)
+    source, lookback, grain_path = _source_context_for_column(schema, column)
     return FieldInfo(column, column, source=source, lookback_days=lookback, grain_path=grain_path)
 
 
-def _lineage_for_column(schema: FrameInfo, column: str) -> tuple[str | None, int, tuple[tuple[str, str], ...]]:
+def _source_context_for_column(schema: FrameInfo, column: str) -> tuple[str | None, int, tuple[tuple[str, str], ...]]:
     if column in schema.fields:
         info = schema.fields[column]
         return info.source, info.lookback_days, info.grain_path
-    return _lineage_from_schema(schema)
+    return _source_context_from_schema(schema)
 
 
-def _lineage_from_schema(schema: FrameInfo) -> tuple[str | None, int, tuple[tuple[str, str], ...]]:
-    infos = _lineage_fields(schema)
+def _source_context_from_schema(schema: FrameInfo) -> tuple[str | None, int, tuple[tuple[str, str], ...]]:
+    infos = _source_context_fields(schema)
     if not infos:
-        return None, _single_lookback(schema), ()
+        return None, _single_field_lookback(schema), ()
     if any(info.source is None for info in infos):
-        return None, _single_lookback(schema), ()
+        return None, _single_field_lookback(schema), ()
     sources = {info.source for info in infos}
     grain_paths = {info.grain_path for info in infos}
     if len(sources) != 1 or len(grain_paths) != 1:
-        return None, _single_lookback(schema), ()
+        return None, _single_field_lookback(schema), ()
     source = next(iter(sources))
     grain_path = next(iter(grain_paths))
-    return source, _single_lookback(schema), grain_path
+    return source, _single_field_lookback(schema), grain_path
 
 
-def _common_lineage(schemas: list[FrameInfo]) -> tuple[str | None, int, tuple[tuple[str, str], ...]]:
+def _common_source_context(schemas: list[FrameInfo]) -> tuple[str | None, int, tuple[tuple[str, str], ...]]:
     lookback = _common_lookback(schemas)
-    lineages = [_lineage_from_schema(schema) for schema in schemas]
-    if any(source is None for source, _, _ in lineages):
+    contexts = [_source_context_from_schema(schema) for schema in schemas]
+    if any(source is None for source, _, _ in contexts):
         return None, lookback, ()
-    sources = {source for source, _, _ in lineages}
-    grain_paths = {grain_path for _, _, grain_path in lineages}
+    sources = {source for source, _, _ in contexts}
+    grain_paths = {grain_path for _, _, grain_path in contexts}
     if len(sources) == 1 and len(grain_paths) == 1:
         return next(iter(sources)), lookback, next(iter(grain_paths))
     return None, lookback, ()
 
 
-def _lineage_fields(schema: FrameInfo) -> tuple[FieldInfo, ...]:
+def _source_context_fields(schema: FrameInfo) -> tuple[FieldInfo, ...]:
     values = tuple(
         info
         for info in schema.fields.values()
@@ -551,8 +551,8 @@ def _lineage_fields(schema: FrameInfo) -> tuple[FieldInfo, ...]:
     return tuple(info for info in schema.fields.values() if not info.is_payload)
 
 
-def _single_lookback(schema: FrameInfo) -> int:
-    values = {info.lookback_days for info in _lineage_fields(schema)}
+def _single_field_lookback(schema: FrameInfo) -> int:
+    values = {info.lookback_days for info in _source_context_fields(schema)}
     return next(iter(values)) if len(values) == 1 else 1
 
 
@@ -571,7 +571,7 @@ def _common_grain(schemas: list[FrameInfo]) -> str:
 
 
 def _common_lookback(schemas: list[FrameInfo]) -> int:
-    values = {_single_lookback(schema) for schema in schemas}
+    values = {_single_field_lookback(schema) for schema in schemas}
     return max(values) if values else 1
 
 

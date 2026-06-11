@@ -10,10 +10,20 @@ import pytest
 
 import draco_model.runtime.engine as engine_module
 from draco_model import Engine, Model
+from draco_model.core import Node
 from draco_model.layers import Aggregate, Col, FillNull, Grid, Join, Metric, Op, Project, Side, Source, Threshold, Where
 from draco_model.layers.aggregate import _auction_merge_targets
+from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
 from draco_model.market.minute_calendar import MinuteCalendar
-from draco_model.runtime.execution import get_info_builder
+from draco_model.runtime.execution import (
+    EvalContext,
+    FrameInfo,
+    get_info_builder,
+    left_join_identity,
+    register_executor,
+    register_info,
+    resolve_identity_join_on,
+)
 
 
 class _Context:
@@ -21,10 +31,11 @@ class _Context:
 
 
 BUILTIN_FRAME_OPS = (
+    "_grid_project",
+    "_grid_source",
     "aggregate",
     "column",
     "fill_null",
-    "grid",
     "join",
     "metric_reserved",
     "op",
@@ -33,6 +44,93 @@ BUILTIN_FRAME_OPS = (
     "source",
     "where",
 )
+
+
+def _test_join_frame(name: str) -> Node:
+    return Node(kind="frame", op="test_join_frame", params={"name": name})
+
+
+@register_executor("test_join_frame")
+def _test_join_frame_executor(node: Node, context: EvalContext) -> pl.LazyFrame:
+    name = str(node.params["name"])
+    if name == "left_price":
+        return pl.DataFrame(
+            {
+                "date": ["20170103", "20170103", "20170103"],
+                "secu_code": [1, 1, 1],
+                "minute": [930, 930, 931],
+                "price": [10.0, 10.1, 10.2],
+                "left_value": [100, 101, 102],
+            }
+        ).lazy()
+    if name == "right_side":
+        return pl.DataFrame(
+            {
+                "date": ["20170103", "20170103", "20170103", "20170103"],
+                "secu_code": [1, 1, 1, 1],
+                "minute": [930, 930, 931, 932],
+                "side": ["buy", "sell", "buy", "sell"],
+                "right_value": [1, 2, 3, 4],
+            }
+        ).lazy()
+    if name == "right_lot":
+        return pl.DataFrame(
+            {
+                "date": ["20170103", "20170103"],
+                "secu_code": [1, 1],
+                "minute": [930, 931],
+                "lot": [7, 8],
+                "third_value": [70, 80],
+            }
+        ).lazy()
+    if name == "daily_value":
+        return pl.DataFrame(
+            {
+                "date": ["20170103"],
+                "secu_code": [1],
+                "daily_value": [42.0],
+            }
+        ).lazy()
+    if name == "daily_minute_value":
+        return pl.DataFrame(
+            {
+                "date": ["20170103"],
+                "secu_code": [1],
+                "minute": [935],
+            }
+        ).lazy()
+    raise ValueError(f"Unsupported test join frame {name!r}.")
+
+
+@register_info("test_join_frame")
+def _test_join_frame_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalContext) -> FrameInfo:
+    name = str(node.params["name"])
+    if name == "left_price":
+        return FrameInfo.from_columns(
+            (*KEY_COLUMNS, "price", "left_value"),
+            identity_keys=(*KEY_COLUMNS, "price"),
+        )
+    if name == "right_side":
+        return FrameInfo.from_columns(
+            (*KEY_COLUMNS, "side", "right_value"),
+            identity_keys=(*KEY_COLUMNS, "side"),
+        )
+    if name == "right_lot":
+        return FrameInfo.from_columns(
+            (*KEY_COLUMNS, "lot", "third_value"),
+            identity_keys=(*KEY_COLUMNS, "lot"),
+        )
+    if name == "daily_value":
+        return FrameInfo.from_columns(
+            ("date", "secu_code", "daily_value"),
+            identity_keys=("date", "secu_code"),
+        )
+    if name == "daily_minute_value":
+        return FrameInfo.from_columns(
+            ("date", "secu_code", "minute"),
+            identity_keys=("date", "secu_code"),
+        )
+    raise ValueError(f"Unsupported test join frame {name!r}.")
 
 
 def test_magic_arithmetic_builds_operator_nodes() -> None:
@@ -67,6 +165,161 @@ def test_public_aliases_cannot_use_payload_prefix() -> None:
         Aggregate("1d", "last", value_col="volume", alias="date")
 
 
+def test_join_rejects_removed_concat_how() -> None:
+    with pytest.raises(ValueError, match="'full' or 'left'"):
+        Join(how="concat")
+
+
+def test_aggregate_requires_alias_when_value_col_is_identity(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    bad = Aggregate("1d", "last", value_col="minute")(raw)
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+
+    with pytest.raises(ValueError, match="conflicts with identity columns"):
+        engine._infer_info(Model("bad_identity_aggregate", "ex2kamt", bad), bad, "20170103")
+
+    ok = Aggregate("1d", "last", value_col="minute", alias="last_minute")(raw)
+    info = engine._infer_info(Model("identity_aggregate_alias", "ex2kamt", ok), ok, "20170103")
+
+    assert info.keys == ("date", "secu_code")
+    assert "last_minute" in info.value_columns()
+
+
+def test_left_join_identity_explicit_on_allows_identity_fanout() -> None:
+    left = FrameInfo.from_columns(
+        (*KEY_COLUMNS, "price", "left_value"),
+        identity_keys=(*KEY_COLUMNS, "price"),
+    )
+    right = FrameInfo.from_columns(
+        (*KEY_COLUMNS, "side", "right_value"),
+        identity_keys=(*KEY_COLUMNS, "side"),
+    )
+
+    with pytest.raises(ValueError, match="price"):
+        left_join_identity(left, right)
+    assert left_join_identity(left, right, on=KEY_COLUMNS) == (*KEY_COLUMNS, "price", "side")
+
+
+def test_resolve_identity_join_on_requires_identity_columns_and_shared_keys() -> None:
+    left = (*KEY_COLUMNS, "price")
+    right = (*KEY_COLUMNS, "price", "side")
+
+    assert resolve_identity_join_on(left, right, None, how="full") == (*KEY_COLUMNS, "price")
+    with pytest.raises(ValueError, match="identity columns"):
+        resolve_identity_join_on(left, right, (*KEY_COLUMNS, "close"), how="left")
+    with pytest.raises(ValueError, match="shared identity columns"):
+        resolve_identity_join_on(left, right, KEY_COLUMNS, how="left")
+
+
+def test_left_join_identity_accepts_daily_on_for_mixed_grain() -> None:
+    minute = FrameInfo.from_columns((*KEY_COLUMNS, "value"), identity_keys=KEY_COLUMNS)
+    daily = FrameInfo.from_columns((*DAILY_KEY_COLUMNS, "daily_value"), identity_keys=DAILY_KEY_COLUMNS)
+
+    assert left_join_identity(minute, daily, on=DAILY_KEY_COLUMNS) == KEY_COLUMNS
+    with pytest.raises(ValueError, match="missing_right"):
+        left_join_identity(minute, daily)
+
+
+def test_join_rejects_on_that_omits_shared_identity(sample_root: Path) -> None:
+    joined = Join(how="left", on=KEY_COLUMNS)(
+        {
+            "trades": Source("trades_tbar"),
+            "cancels": Source("cancels_tbar"),
+        }
+    )
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+
+    with pytest.raises(ValueError, match="shared identity columns"):
+        engine._infer_info(Model("bad_join_on", "ex2kamt", joined), joined, "20170103")
+
+
+def test_join_left_with_explicit_on_materializes_union_identity(sample_root: Path) -> None:
+    left = _test_join_frame("left_price")
+    right = _test_join_frame("right_side")
+    joined = Join(how="left", on=KEY_COLUMNS)({"left": left, "right": right})
+    model = Model("left_join_identity", "ex2kamt", joined)
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+
+    info = engine._infer_info(model, joined, "20170103")
+    frame = engine.evaluate(model, joined, "20170103").collect()
+
+    assert info.keys == (*KEY_COLUMNS, "price", "side")
+    assert tuple(frame.columns) == (*KEY_COLUMNS, "price", "side", "left", "right")
+    assert frame.height == 5
+    assert frame.select(info.keys).unique().height == 5
+    assert frame.filter(pl.col("minute") == 930)["right"].to_list() == [1, 2, 1, 2]
+
+
+def test_join_left_supports_multiple_inputs(sample_root: Path) -> None:
+    left = _test_join_frame("left_price")
+    right = _test_join_frame("right_side")
+    third = _test_join_frame("right_lot")
+    joined = Join(how="left", on=KEY_COLUMNS)({"left": left, "right": right, "third": third})
+    model = Model("left_join_three_inputs", "ex2kamt", joined)
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+
+    info = engine._infer_info(model, joined, "20170103")
+    frame = engine.evaluate(model, joined, "20170103").collect()
+
+    assert info.keys == (*KEY_COLUMNS, "price", "side", "lot")
+    assert tuple(frame.columns) == (*KEY_COLUMNS, "price", "side", "lot", "left", "right", "third")
+    assert frame.height == 5
+    assert frame.select(info.keys).unique().height == 5
+    assert frame.filter((pl.col("minute") == 930) & (pl.col("side") == "buy"))["third"].to_list() == [70, 70]
+
+
+def test_join_full_defaults_to_pairwise_identity_intersection(sample_root: Path) -> None:
+    left = _test_join_frame("left_price")
+    right = _test_join_frame("right_side")
+    joined = Join(how="full")({"left": left, "right": right})
+    model = Model("full_join_identity", "ex2kamt", joined)
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+
+    info = engine._infer_info(model, joined, "20170103")
+    frame = engine.evaluate(model, joined, "20170103").collect()
+
+    assert info.keys == (*KEY_COLUMNS, "price", "side")
+    assert tuple(frame.columns) == (*KEY_COLUMNS, "price", "side", "left", "right")
+    assert frame.height == 6
+    assert frame.select(info.keys).unique().height == 6
+    unmatched = frame.filter(pl.col("minute") == 932)
+    assert unmatched["price"].to_list() == [None]
+    assert unmatched["left"].to_list() == [None]
+    assert unmatched["side"].to_list() == ["sell"]
+    assert unmatched["right"].to_list() == [4]
+
+
+def test_join_full_rejects_mixed_daily_and_minute_identities(sample_root: Path) -> None:
+    joined = Join()({"minute_feature": _test_join_frame("left_price"), "daily_feature": _test_join_frame("daily_value")})
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+
+    with pytest.raises(ValueError, match="cannot mix daily identity"):
+        engine._infer_info(Model("bad_mixed_full_join", "ex2kamt", joined), joined, "20170103")
+
+
+def test_join_left_allows_explicit_mixed_daily_and_minute_join(sample_root: Path) -> None:
+    joined = Join(how="left", on=DAILY_KEY_COLUMNS)(
+        {"minute_feature": _test_join_frame("left_price"), "daily_feature": _test_join_frame("daily_value")}
+    )
+    model = Model("mixed_left_join", "ex2kamt", joined)
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+
+    info = engine._infer_info(model, joined, "20170103")
+    frame = engine.evaluate(model, joined, "20170103").collect()
+
+    assert info.keys == (*KEY_COLUMNS, "price")
+    assert tuple(frame.columns) == (*KEY_COLUMNS, "price", "minute_feature", "daily_feature")
+    assert frame.height == 3
+    assert frame["daily_feature"].to_list() == [42.0, 42.0, 42.0]
+
+
 def test_metric_amount_uses_price_times_volume(sample_root: Path) -> None:
     raw = Source("trades_tbar")
     amount = Metric("amount", raw)
@@ -75,7 +328,7 @@ def test_metric_amount_uses_price_times_volume(sample_root: Path) -> None:
     frame = Engine(data_root=sample_root).evaluate(model, amount, "20170103").collect()
 
     row = frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 930))
-    assert [node.op for node in model.nodes()] == ["source", "op", "aggregate"]
+    assert [node.op for node in model.nodes()] == ["source", "op", "aggregate", "project"]
     assert row["amount"].to_list() == pytest.approx([152.0])
 
 
@@ -111,27 +364,26 @@ def test_threshold_filter_keeps_matching_rows(sample_root: Path) -> None:
     assert rows == {"minute": [932, 933], "volume": [30.0, 20.0]}
 
 
-def test_condition_nodes_do_not_capture_frame_subtrees() -> None:
+def test_where_stores_condition_in_params_not_subtree() -> None:
     raw = Source("trades_tbar")
     other = Source("quotes_tbar")
     raw_where = Where(Side("buy"))(raw)
     other_where = Where(Side("buy"))(other)
-    raw_condition = raw_where.inputs["condition"]
-    other_condition = other_where.inputs["condition"]
 
     assert raw_where.inputs["frame"] is raw
-    assert raw_condition.inputs == {}
-    assert other_condition.inputs == {}
-    assert raw_condition.id == other_condition.id
+    assert set(raw_where.inputs) == {"frame"}
+    assert set(other_where.inputs) == {"frame"}
+    assert raw_where.params["condition"] == {"op": "side", "params": {"side": "buy"}}
+    assert raw_where.params == other_where.params
 
 
-def test_filtered_raw_column_keeps_source_lineage(sample_root: Path) -> None:
+def test_filtered_raw_column_keeps_field_source_context(sample_root: Path) -> None:
     raw = Source("trades_tbar")
     filtered_price = Col("price").alias("filtered_price")(Where(Threshold("minute", op="==", value=931))(raw))
     engine = Engine(data_root=sample_root)
     engine._ensure_calendar()
 
-    schema = engine._infer_info(Model("filtered_price_lineage", "ex2kamt", filtered_price), filtered_price, "20170103")
+    schema = engine._infer_info(Model("filtered_price_source_context", "ex2kamt", filtered_price), filtered_price, "20170103")
     info = schema.fields["filtered_price"]
 
     assert info.source == "trades_tbar"
@@ -154,7 +406,7 @@ def test_vwap_component_and_field_aggregation(sample_root: Path) -> None:
     assert component_row["vwap"].to_list() == pytest.approx([673.0 / 65.0])
     assert field_row["vwap"].to_list() == pytest.approx([(152.0 / 15.0 + 10.5 + 10.3) / 3.0])
     assert any(column.startswith("__op_vwap") for column in component_frame.columns)
-    assert any(column.startswith("__op_vwap") for column in field_frame.columns)
+    assert not any(column.startswith("__op_vwap") for column in field_frame.columns)
 
 
 def test_auction_merge_maps_before_aggregation(sample_root: Path) -> None:
@@ -323,7 +575,21 @@ def test_fillnull_state_for_vwap_and_preclose(sample_root: Path) -> None:
 
     assert vwap_frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 935))["vwap"].to_list() == [10.3]
     assert preclose_frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 930))["preclose"].to_list() == [9.85]
-    assert any(column.startswith("__op_vwap") for column in vwap_frame.columns)
+    assert not any(column.startswith("__op_vwap") for column in vwap_frame.columns)
+
+
+def test_fillnull_drops_payload_and_blocks_component_aggregation(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
+    filled = FillNull("state")(vwap)
+    aggregated = Aggregate("5m", "sum", apply_to="components")(filled)
+
+    with pytest.raises(ValueError, match="not supported after FillNull"):
+        Engine(data_root=sample_root).evaluate(
+            Model("filled_component_agg", "ex2kamt", aggregated),
+            aggregated,
+            "20170103",
+        ).collect()
 
 
 def test_fillnull_state_uses_grain_path_after_operator(sample_root: Path) -> None:
@@ -343,13 +609,13 @@ def test_fillnull_state_uses_grain_path_after_operator(sample_root: Path) -> Non
     assert row["probe_shifted"].to_list() == [10.3]
 
 
-def test_fillnull_state_rejects_multi_source_lineage(tmp_path: Path) -> None:
+def test_fillnull_state_rejects_multi_source_field_info(tmp_path: Path) -> None:
     _write_multi_source_fixture(tmp_path)
     trade_volume = Metric("volume", Source("trades_tbar"))
     quote_volume = Metric("volume", Source("quotes_tbar"))
     filled = FillNull("state")((trade_volume - quote_volume).alias("net_volume"))
 
-    with pytest.raises(ValueError, match="requires source lineage"):
+    with pytest.raises(ValueError, match="requires FieldInfo.source"):
         Engine(data_root=tmp_path / "data").evaluate(
             Model("multi_source_fill", "ex2kamt", filled),
             filled,
@@ -421,6 +687,35 @@ def test_grid_aligns_raw_source_before_metric(sample_root: Path) -> None:
     assert volume_frame.filter((pl.col("secu_code") == 2) & (pl.col("minute") == 930))["volume"].to_list() == [None]
 
 
+def test_grid_broadcasts_daily_frame_to_minutes(sample_root: Path) -> None:
+    daily = _test_join_frame("daily_value")
+    gridded = Grid()(daily)
+    model = Model("grid_daily", "ex2kamt", gridded)
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+
+    info = engine._infer_info(model, gridded, "20170103")
+    frame = engine.evaluate(model, gridded, "20170103").collect()
+
+    assert info.keys == KEY_COLUMNS
+    assert tuple(frame.columns) == (*KEY_COLUMNS, "daily_value")
+    assert frame.height == 2 * len(MinuteCalendar().minbars())
+    assert frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 930))["daily_value"].to_list() == [42.0]
+    assert frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 934))["daily_value"].to_list() == [42.0]
+    assert frame.filter((pl.col("secu_code") == 2) & (pl.col("minute") == 930))["daily_value"].to_list() == [None]
+
+
+def test_grid_rejects_value_column_that_conflicts_with_output_identity(sample_root: Path) -> None:
+    daily_minute = _test_join_frame("daily_minute_value")
+    gridded = Grid()(daily_minute)
+    model = Model("grid_daily_minute_conflict", "ex2kamt", gridded)
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+
+    with pytest.raises(ValueError, match="conflict with value columns"):
+        engine._infer_info(model, gridded, "20170103")
+
+
 def test_fillnull_ffill_and_numeric_modes(sample_root: Path) -> None:
     raw = Source("trades_tbar")
     close = Grid()(Metric("close", raw))
@@ -437,7 +732,7 @@ def test_fillnull_ffill_and_numeric_modes(sample_root: Path) -> None:
     assert zero_frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 935))["close"].to_list() == [0.0]
 
 
-def test_daily_aggregate_preserves_payload_until_project(sample_root: Path) -> None:
+def test_aggregate_apply_to_field_drops_payload(sample_root: Path) -> None:
     raw = Source("trades_tbar")
     vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
     daily = Aggregate("1d", "mean", value_col="vwap", alias="value")(vwap)
@@ -447,7 +742,7 @@ def test_daily_aggregate_preserves_payload_until_project(sample_root: Path) -> N
     daily_frame = engine.evaluate(Model("daily_vwap", "ex2kamt", daily), daily, "20170103").collect()
     projected_frame = engine.evaluate(Model("projected_daily_vwap", "ex2kamt", projected), projected, "20170103").collect()
 
-    assert any(column.startswith("__op_vwap") for column in daily_frame.columns)
+    assert not any(column.startswith("__op_vwap") for column in daily_frame.columns)
     assert not any(column.startswith("__op_vwap") for column in projected_frame.columns)
 
 
@@ -457,6 +752,20 @@ def test_preclose_without_state_raises(sample_root: Path) -> None:
 
     with pytest.raises(ValueError, match="preclose metric is reserved"):
         Engine(data_root=sample_root).evaluate(Model("bad_preclose", "ex2kamt", preclose), preclose, "20170103").collect()
+
+
+def test_preclose_source_context_comes_from_parent_field_info(sample_root: Path) -> None:
+    raw = Source("trades_tbar", lookback_days=2)
+    derived = Col("price").alias("px")(raw)
+    preclose = Metric("preclose", derived, alias="prev_close")
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+
+    schema = engine._infer_info(Model("preclose_source_context", "ex2kamt", preclose), preclose, "20170104")
+    info = schema.fields["prev_close"]
+
+    assert info.source == "trades_tbar"
+    assert info.lookback_days == 2
 
 
 def test_preclose_alias_uses_operator_metadata(sample_root: Path) -> None:
@@ -545,7 +854,16 @@ def test_trace_and_mermaid_show_expanded_operator_dag(sample_root: Path) -> None
     steps = Engine(data_root=sample_root).trace(model, "20170103")
     mermaid = model.explain_mermaid()
 
-    assert [step.node.op for step in steps] == ["source", "op", "aggregate", "column", "aggregate", "op"]
+    assert [step.node.op for step in steps] == [
+        "source",
+        "op",
+        "aggregate",
+        "project",
+        "column",
+        "aggregate",
+        "project",
+        "op",
+    ]
     assert "op" in mermaid
     assert "ratio_field" not in mermaid
 
@@ -556,7 +874,8 @@ def test_frame_infos_match_materialized_columns(sample_root: Path) -> None:
     filled = FillNull("state")(vwap)
     corr = Op("rolling_corr", Metric("amount", raw), Metric("volume", raw), window=2, alias="corr")
     daily = Aggregate("1d", "mean", value_col="vwap", alias="daily_vwap")(vwap)
-    output = Project()(Join()({"filled": filled, "corr": corr, "daily": daily}))
+    minute_features = Join(how="left")({"filled": filled, "corr": corr})
+    output = Project()(Join(how="left", on=DAILY_KEY_COLUMNS)({"minute_features": minute_features, "daily": daily}))
     model = Model("plan_columns", "ex2kamt", output)
     engine = Engine(data_root=sample_root)
     engine._ensure_calendar()

@@ -1,20 +1,20 @@
 # Filters
 
-Filters use a `Condition` and `Where` to keep matching rows.
+Filters use `Where` plus a filter spec to keep matching rows.
 
 ## `Where`
 
 ```python
-Where(condition: Condition, *, name: str | None = None)
+Where(condition: Side | Flag | Threshold | TopQuantile, *, name: str | None = None)
 ```
 
-Apply a condition to a frame.
+Apply a filter spec to a frame.
 
 ```python
 filtered = Where(Side("buy"))(raw)
 ```
 
-## Conditions
+## Filter Specs
 
 ### `Side`
 
@@ -32,7 +32,7 @@ Execution maps these to the normalized `side` codes used by the current data sou
 Flag(column: str)
 ```
 
-Boolean column condition used by metric recipes, such as `is_first` and `is_last`.
+Boolean column filter used by metric recipes, such as `is_first` and `is_last`.
 
 ### `Threshold`
 
