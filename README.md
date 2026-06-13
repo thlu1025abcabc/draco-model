@@ -132,6 +132,8 @@ cross_day_corr = Op("rolling_corr", amount, volume, window=5, alias="corr_5_cros
 - `cross_day=False` 是默认行为。分钟级 rolling 按 `(date, secu_code)` 分组，等价于日内重置。
 - `cross_day=True` 时，分钟级 rolling 只按 `secu_code` 分组，可以跨交易日使用上一日窗口。
 - `Source(..., lookback_days=...)` 由调用方显式指定；rolling operator 不会根据 `window` 自动扩大 lookback。
+- rolling operator 只接受恰好两个 frame 节点操作数；传 `Col(...)` 或标量会在构造期报错。
+- 窗口内方差为零（或浮点误差导致非正）时输出 null；`rolling_corr` 结果裁剪到 `[-1, 1]`。
 
 ## Aggregate 语义
 

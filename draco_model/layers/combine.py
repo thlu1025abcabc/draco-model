@@ -296,7 +296,7 @@ def _join_on_for_step(
 
 
 def _renamed_field(schema: FrameInfo, renames: dict[str, str], source: str, target: str) -> FieldInfo:
-    info = schema.fields.get(source, FieldInfo(source, source))
+    info = schema.fields[source]
     component_renames = tuple(renames.get(component, component) for component in info.components)
     return replace(
         info,

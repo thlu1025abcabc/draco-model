@@ -122,6 +122,52 @@ class FrameInfo:
         """Return internal payload columns."""
         return [info.column for info in self.fields.values() if info.is_payload]
 
+    def field_for(self, column: str) -> FieldInfo:
+        """Return field metadata for a frame column; every frame column has an entry."""
+        return self.fields[column]
+
+    def single_value_column(self, *, subject: str = "Operator") -> str:
+        """Return the single public value column or raise a clear error."""
+        values = self.value_columns()
+        if len(values) != 1:
+            raise ValueError(f"{subject} requires exactly one public value column, got {values}.")
+        return values[0]
+
+    def merged_source_context(self) -> tuple[str | None, int, tuple[tuple[str, str], ...]]:
+        """Return the (source, lookback_days, grain_path) a derived field inherits."""
+        infos = self._source_context_fields()
+        lookback = max((info.lookback_days for info in infos), default=1)
+        if not infos or any(info.source is None for info in infos):
+            return None, lookback, ()
+        sources = {info.source for info in infos}
+        grain_paths = {info.grain_path for info in infos}
+        if len(sources) != 1 or len(grain_paths) != 1:
+            return None, lookback, ()
+        return next(iter(sources)), lookback, next(iter(grain_paths))
+
+    def _source_context_fields(self) -> tuple[FieldInfo, ...]:
+        values = tuple(
+            info
+            for info in self.fields.values()
+            if info.is_public and not info.is_identity and not info.is_payload
+        )
+        if values:
+            return values
+        return tuple(info for info in self.fields.values() if not info.is_payload)
+
+
+def merge_source_contexts(schemas: list[FrameInfo]) -> tuple[str | None, int, tuple[tuple[str, str], ...]]:
+    """Merge per-frame source contexts for a derived field with multiple inputs."""
+    contexts = [schema.merged_source_context() for schema in schemas]
+    lookback = max((lookback for _, lookback, _ in contexts), default=1)
+    if any(source is None for source, _, _ in contexts):
+        return None, lookback, ()
+    sources = {source for source, _, _ in contexts}
+    grain_paths = {grain_path for _, _, grain_path in contexts}
+    if len(sources) == 1 and len(grain_paths) == 1:
+        return next(iter(sources)), lookback, next(iter(grain_paths))
+    return None, lookback, ()
+
 
 def infer_grain_label(info: FrameInfo) -> str:
     """Infer a coarse frame label for logging and legacy checks."""

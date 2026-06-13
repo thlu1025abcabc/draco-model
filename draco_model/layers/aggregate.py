@@ -8,7 +8,6 @@ import polars as pl
 from draco_model.core import Layer, Node
 from draco_model.layers.expressions import sum_or_null
 from draco_model.layers.names import validate_public_alias
-from draco_model.layers.operators import ARITHMETIC_OPS
 from draco_model.market.minute_calendar import AUCTION_MINUTES
 from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
 from draco_model.runtime.execution import EvalContext, FieldInfo, FrameInfo, register_executor, register_info
@@ -125,8 +124,8 @@ def _aggregate(node: Node, context: EvalContext) -> pl.LazyFrame:
         return grouped
 
     interval = parse_minute_frequency(frequency)
-    if "minute" in schema.columns:
-        frame = frame.with_columns(pl.col("minute").alias("__order_minute"))
+    _require_minute_columns(schema, frequency)
+    frame = frame.with_columns(pl.col("minute").alias("__order_minute"))
     frame = _apply_auction(frame, auction, context, interval)
     if interval == 1:
         grouped, _ = _aggregate_values(
@@ -137,7 +136,7 @@ def _aggregate(node: Node, context: EvalContext) -> pl.LazyFrame:
             apply_to,
             value_col,
             alias,
-            order_col="__order_minute" if "minute" in schema.columns else None,
+            order_col="__order_minute",
             grain_step=(frequency, auction),
         )
         return grouped.sort(list(KEY_COLUMNS))
@@ -167,11 +166,10 @@ def _aggregate_info(node: Node, parent_infos: dict[str, FrameInfo], context: Eva
     auction = str(node.params.get("auction", "keep"))
     if frequency in DAILY_FREQUENCIES:
         keys = DAILY_KEY_COLUMNS
-        grain = "daily"
     else:
         parse_minute_frequency(frequency)
+        _require_minute_columns(parent, frequency)
         keys = KEY_COLUMNS
-        grain = "minute"
     output_info, _, _ = _aggregate_specs_from_info(parent, keys, apply_to, value_col, alias, grain_step=(frequency, auction))
     return output_info
 
@@ -185,11 +183,17 @@ def aggregate_value_columns(schema: FrameInfo, value_col: object | None = None) 
         return [col]
     values = schema.value_columns()
     if not values:
-        keys = set(schema.keys)
-        values = [column for column in schema.columns if column not in keys and not column.startswith("__")]
-    if not values:
         raise ValueError("Aggregate input has no public value columns.")
     return values
+
+
+def _require_minute_columns(schema: FrameInfo, frequency: str) -> None:
+    missing = [column for column in KEY_COLUMNS if column not in schema.columns]
+    if missing:
+        raise ValueError(
+            f"Aggregate(frequency={frequency!r}) requires a minute-grain input with columns "
+            f"{list(KEY_COLUMNS)}; missing {missing}."
+        )
 
 
 def parse_minute_frequency(frequency: str) -> int:
@@ -266,7 +270,7 @@ def _aggregate_specs_from_info(
     specs: list[_AggregateValueSpec] = []
     consumed_component_payloads: set[str] = set()
     for column in values:
-        info = _field_for_column(parent, column)
+        info = parent.field_for(column)
         output = str(alias) if alias is not None else column
         if output in {*parent.keys, *keys}:
             raise ValueError(
@@ -321,11 +325,11 @@ def _aggregate_specs_from_info(
     output_columns = set(columns) - set(keys)
     passthrough_payloads = tuple(
         payload
-        for payload in _payload_columns(parent)
+        for payload in parent.payload_columns()
         if payload not in consumed_component_payloads and payload not in output_columns
     )
     for payload in passthrough_payloads:
-        fields[payload] = parent.fields.get(payload, FieldInfo(payload, payload, is_public=False, is_payload=True))
+        fields[payload] = parent.fields[payload]
     columns.extend(passthrough_payloads)
     return (
         FrameInfo.from_columns(
@@ -445,13 +449,3 @@ def _operator_expr(operator: str, components: tuple[str, ...]) -> pl.Expr:
     if operator == "div":
         return pl.when(right == 0).then(None).otherwise(left / right)
     raise ValueError(f"Unsupported component aggregation operator {operator!r}.")
-
-
-def _field_for_column(schema: FrameInfo, column: str) -> FieldInfo:
-    if column in schema.fields:
-        return schema.fields[column]
-    return FieldInfo(name=column, column=column)
-
-
-def _payload_columns(schema: FrameInfo) -> list[str]:
-    return schema.payload_columns()

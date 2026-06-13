@@ -138,19 +138,33 @@ def _normalize_inputs(inputs: Node | Mapping[str, Node]) -> dict[str, Node]:
 
 
 def _topological_nodes(output: Node) -> list[Node]:
-    out: list[Node] = []
-    visited: set[str] = set()
+    order: list[str] = []
+    chosen: dict[str, Node] = {}
+    seen_objects: set[int] = set()
 
     def visit(node: Node) -> None:
-        if node.id in visited:
+        # Traverse every object so explicit names inside duplicate subtrees are seen,
+        # but emit each structural id once.
+        if id(node) in seen_objects:
             return
-        visited.add(node.id)
+        seen_objects.add(id(node))
+        prior = chosen.get(node.id)
+        if prior is None:
+            chosen[node.id] = node
+        else:
+            if node.name is not None and prior.name is not None and node.name != prior.name:
+                raise ValueError(
+                    f"Structurally identical nodes have conflicting names {prior.name!r} and {node.name!r}."
+                )
+            if node.name is not None and prior.name is None:
+                chosen[node.id] = node
         for parent in node.inputs.values():
             visit(parent)
-        out.append(node)
+        if prior is None:
+            order.append(node.id)
 
     visit(output)
-    return out
+    return [chosen[node_id] for node_id in order]
 
 
 def resolve_node_names(nodes: list[Node]) -> dict[str, str]:

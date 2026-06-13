@@ -10,13 +10,15 @@ import pytest
 
 import draco_model.runtime.engine as engine_module
 from draco_model import Engine, Model
-from draco_model.core import Node
+from draco_model.core import Node, resolve_node_names
 from draco_model.layers import Aggregate, Col, FillNull, Grid, Join, Metric, Op, Project, Side, Source, Threshold, Where
 from draco_model.layers.aggregate import _auction_merge_targets
+from draco_model.layers.operators import _window_op
 from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
 from draco_model.market.minute_calendar import MinuteCalendar
 from draco_model.runtime.execution import (
     EvalContext,
+    FieldInfo,
     FrameInfo,
     get_info_builder,
     left_join_identity,
@@ -1083,3 +1085,92 @@ def _daily_k_fixture_data(sec_codes: list[str], trading_days: list[str], preclos
         "free_share": [800.0] * n,
         "list_date": ["19910403"] * n,
     }
+
+
+def test_merged_source_context_uses_max_lookback() -> None:
+    info = FrameInfo.from_columns(
+        ("date", "secu_code", "minute", "a", "b"),
+        identity_keys=KEY_COLUMNS,
+        fields={
+            "a": FieldInfo("a", "a", source="trades_tbar", lookback_days=5),
+            "b": FieldInfo("b", "b", source="trades_tbar", lookback_days=3),
+        },
+    )
+
+    assert info.merged_source_context() == ("trades_tbar", 5, ())
+
+
+def test_mixed_lookback_operands_inherit_max_lookback(sample_root: Path) -> None:
+    slow = Metric("volume", Source("trades_tbar", lookback_days=2))
+    fast = Metric("no", Source("trades_tbar"))
+    combined = (slow + fast).alias("combined")
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+
+    schema = engine._infer_info(Model("mixed_lookback", "ex2kamt", combined), combined, "20170104")
+
+    assert schema.fields["combined"].lookback_days == 2
+
+
+def test_window_op_rejects_non_frame_operands() -> None:
+    raw = Source("trades_tbar")
+    amount = Metric("amount", raw)
+
+    with pytest.raises(ValueError, match="exactly two frame"):
+        Op("rolling_corr", Col("price"), Col("volume"), window=2)
+    with pytest.raises(ValueError, match="exactly two frame"):
+        Op("rolling_beta", amount, 2.0, window=2)
+
+
+def test_rolling_corr_guards_float_negative_variance() -> None:
+    base = 1.0e8
+    frame = pl.DataFrame(
+        {
+            "date": ["20170103"] * 4,
+            "secu_code": [1] * 4,
+            "minute": [930, 931, 932, 933],
+            "y": [base, base + 3e-4, base + 1e-4, base + 2e-4],
+            "x": [base + 2e-4, base + 1e-4, base + 3e-4, base],
+        }
+    ).lazy()
+
+    out = _window_op(frame, KEY_COLUMNS, "rolling_corr", [pl.col("y"), pl.col("x")], "corr", 3, False, []).collect()
+
+    corr = out["corr"]
+    assert not corr.fill_null(0.0).is_nan().any()
+    assert corr.drop_nulls().abs().max() <= 1.0
+
+
+def test_aggregate_minute_frequency_requires_minute_input(sample_root: Path) -> None:
+    daily = Aggregate("1d", "sum", value_col="volume", alias="volume")(Metric("volume", Source("trades_tbar")))
+    five_minute = Aggregate("5m", "sum", value_col="volume", alias="volume")(daily)
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+
+    with pytest.raises(ValueError, match="minute-grain input"):
+        engine._infer_info(Model("daily_to_minute", "ex2kamt", five_minute), five_minute, "20170103")
+
+
+def test_fillnull_state_requires_minute_input(sample_root: Path) -> None:
+    daily = Aggregate("1d", "last", value_col="close", alias="close")(Metric("close", Source("trades_tbar")))
+    filled = FillNull("state")(daily)
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+
+    with pytest.raises(ValueError, match="minute-grain input"):
+        engine._infer_info(Model("daily_state_fill", "ex2kamt", filled), filled, "20170103")
+
+
+def test_conflicting_names_on_identical_structure_raise() -> None:
+    combined = Source("trades_tbar", name="left_raw") + Source("trades_tbar", name="right_raw")
+
+    with pytest.raises(ValueError, match="conflicting names"):
+        Model("conflicting_names", "ex2kamt", combined).nodes()
+
+
+def test_duplicate_structure_keeps_explicit_name() -> None:
+    combined = Source("trades_tbar") + Source("trades_tbar", name="raw_trades")
+
+    names = resolve_node_names(Model("duplicate_structure", "ex2kamt", combined).nodes())
+
+    assert "raw_trades" in names.values()

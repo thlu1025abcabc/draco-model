@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from time import perf_counter
+from typing import Callable
 
 import polars as pl
 
@@ -113,18 +114,7 @@ class Engine:
             if node.kind != "frame":
                 continue
 
-            assert self.trading_calendar is not None
-            context = EvalContext(
-                model=model,
-                eval_date=eval_date,
-                sources=self.sources,
-                universes=self.universes,
-                minute_calendar=self.minute_calendar,
-                trading_calendar=self.trading_calendar,
-                evaluate=evaluate,
-                infer_info=lambda parent: self._infer_info(model, parent, eval_date),
-                grid_cache=self._grid_memory,
-            )
+            context = self._context(model, eval_date, evaluate=evaluate)
             frame = get_executor(node.op)(node, context).collect()
             materialized[node.id] = frame
             steps.append(TraceStep(index=len(steps), resolved_name=names[node.id], node=node, frame=frame))
@@ -146,6 +136,20 @@ class Engine:
             logger.debug("calendar.load data_root=%s", self.data_root)
             self.trading_calendar = TradingCalendar.from_data_root(self.data_root)
 
+    def _context(self, model: Model, eval_date: str, *, evaluate: Callable[[Node], pl.LazyFrame] | None = None) -> EvalContext:
+        assert self.trading_calendar is not None
+        return EvalContext(
+            model=model,
+            eval_date=eval_date,
+            sources=self.sources,
+            universes=self.universes,
+            minute_calendar=self.minute_calendar,
+            trading_calendar=self.trading_calendar,
+            evaluate=evaluate or (lambda parent: self._eval(model, parent, eval_date)),
+            infer_info=lambda parent: self._infer_info(model, parent, eval_date),
+            grid_cache=self._grid_memory,
+        )
+
     def _eval(self, model: Model, node: Node, eval_date: str) -> pl.LazyFrame:
         key = (model.universe, node.id, eval_date)
         if key in self._memory:
@@ -153,19 +157,7 @@ class Engine:
             return self._memory[key]
 
         logger.debug("eval.cache_miss universe=%s date=%s node_id=%s op=%s", model.universe, eval_date, node.id, node.op)
-        assert self.trading_calendar is not None
-        context = EvalContext(
-            model=model,
-            eval_date=eval_date,
-            sources=self.sources,
-            universes=self.universes,
-            minute_calendar=self.minute_calendar,
-            trading_calendar=self.trading_calendar,
-            evaluate=lambda parent: self._eval(model, parent, eval_date),
-            infer_info=lambda parent: self._infer_info(model, parent, eval_date),
-            grid_cache=self._grid_memory,
-        )
-        out = get_executor(node.op)(node, context)
+        out = get_executor(node.op)(node, self._context(model, eval_date))
 
         self._memory[key] = out
         return out
@@ -182,18 +174,7 @@ class Engine:
             for input_name, parent in node.inputs.items()
             if parent.kind == "frame"
         }
-        assert self.trading_calendar is not None
-        context = EvalContext(
-            model=model,
-            eval_date=eval_date,
-            sources=self.sources,
-            universes=self.universes,
-            minute_calendar=self.minute_calendar,
-            trading_calendar=self.trading_calendar,
-            evaluate=lambda parent: self._eval(model, parent, eval_date),
-            infer_info=lambda parent: self._infer_info(model, parent, eval_date),
-            grid_cache=self._grid_memory,
-        )
+        context = self._context(model, eval_date)
         builder = get_info_builder(node.op)
         if builder is not None:
             info = builder(node, parent_infos, context)

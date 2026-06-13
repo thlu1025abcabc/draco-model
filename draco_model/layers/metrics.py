@@ -58,7 +58,7 @@ def _metric_reserved(node: Node, context: EvalContext) -> pl.LazyFrame:
 @register_info("metric_reserved")
 def _metric_reserved_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalContext) -> FrameInfo:
     alias = str(node.params["alias"])
-    source, lookback = _field_source_context(parent_infos["input"])
+    source, lookback, _ = parent_infos["input"].merged_source_context()
     return FrameInfo.from_columns(
         (*KEY_COLUMNS, alias),
         identity_keys=KEY_COLUMNS,
@@ -73,22 +73,3 @@ def _metric_reserved_info(node: Node, parent_infos: dict[str, FrameInfo], contex
             )
         },
     )
-
-
-def _field_source_context(info: FrameInfo) -> tuple[str | None, int]:
-    fields = [
-        field
-        for field in info.fields.values()
-        if field.is_public and not field.is_identity and not field.is_payload
-    ]
-    if not fields:
-        fields = [field for field in info.fields.values() if not field.is_payload]
-    source_fields = [field for field in fields if field.source is not None]
-    lookback_fields = source_fields or fields
-    lookback = max((field.lookback_days for field in lookback_fields), default=1)
-    if not source_fields:
-        return None, lookback
-    sources = {field.source for field in source_fields}
-    if len(sources) != 1:
-        return None, lookback
-    return next(iter(sources)), lookback

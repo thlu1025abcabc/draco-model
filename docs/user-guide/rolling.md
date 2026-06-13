@@ -29,6 +29,14 @@ For minute-grain inputs:
 
 For daily-grain inputs, rolling groups by `secu_code`.
 
+## Operands and Degenerate Windows
+
+Rolling operators require exactly two frame (Node) operands. Passing `Col(...)` or scalar
+operands raises at construction time.
+
+When a window has zero variance (or float error makes the computed variance non-positive),
+the output is null. `rolling_corr` results are clipped to `[-1, 1]`.
+
 ## Lookback
 
 `Source(..., lookback_days=...)` is explicit. Rolling operators do not automatically increase source lookback based on `window`.

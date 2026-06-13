@@ -138,8 +138,10 @@ def _fill_null(node: Node, context: EvalContext) -> pl.LazyFrame:
     schema = context.infer_info(parent)
     output_info = _fill_null_info_from_parent(schema)
     value = node.params.get("value", "state")
-    value_col = _single_value_column(schema)
-    field_info = _field_for_column(schema, value_col)
+    if value == "state":
+        _require_minute_columns(schema)
+    value_col = schema.single_value_column(subject="FillNull")
+    field_info = schema.field_for(value_col)
     logger.debug(
         "fill_null.start node_id=%s mode=%s value_col=%s grain=%s keys=%s",
         node.id,
@@ -180,12 +182,14 @@ def _fill_null(node: Node, context: EvalContext) -> pl.LazyFrame:
 
 @register_info("fill_null")
 def _fill_null_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalContext) -> FrameInfo:
+    if node.params.get("value", "state") == "state":
+        _require_minute_columns(parent_infos["input"])
     return _fill_null_info_from_parent(parent_infos["input"])
 
 
 def _fill_null_info_from_parent(parent: FrameInfo) -> FrameInfo:
-    value_col = _single_value_column(parent)
-    info = _field_for_column(parent, value_col)
+    value_col = parent.single_value_column(subject="FillNull")
+    info = parent.field_for(value_col)
     fields = dict(parent.fields)
     fields[value_col] = replace(info, name=value_col, column=value_col, operator="fill_null", components=(), component_agg=False)
     return FrameInfo.from_columns(
@@ -352,17 +356,13 @@ def _build_close_state_subtree(source_name: str, lookback_days: int, grain_path:
     return node
 
 
-def _single_value_column(schema: FrameInfo) -> str:
-    values = schema.value_columns()
-    if len(values) != 1:
-        raise ValueError(f"FillNull requires exactly one public value column, got {values}.")
-    return values[0]
-
-
-def _field_for_column(schema: FrameInfo, column: str) -> FieldInfo:
-    if column in schema.fields:
-        return schema.fields[column]
-    return FieldInfo(column, column)
+def _require_minute_columns(schema: FrameInfo) -> None:
+    missing = [column for column in KEY_COLUMNS if column not in schema.columns]
+    if missing:
+        raise ValueError(
+            f"FillNull('state') requires a minute-grain input with columns {list(KEY_COLUMNS)}; "
+            f"missing {missing}."
+        )
 
 
 def _is_numeric_fill(value: object) -> bool:

@@ -5,20 +5,6 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from draco_model import Node
-from draco_model.runtime.execution import EvalContext, register_executor
-
-
-@register_executor("constant_test_frame")
-def _constant_test_frame(node: Node, context: EvalContext) -> pl.LazyFrame:
-    return pl.DataFrame(
-        {
-            "date": [context.eval_date],
-            "secu_code": [1],
-            "value": [float(node.params["value"])],
-        }
-    ).lazy()
-
 
 @pytest.fixture
 def engine_data_root(tmp_path: Path) -> Path:
