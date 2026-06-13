@@ -16,6 +16,16 @@ Minute or raw frames join on `(date, secu_code, minute)`. Daily frames join on `
 
 Grid determines join keys from frame identity keys, not from ordinary columns. If a value column would collide with the output grid identity, for example a daily value column named `minute`, `Grid()` raises; alias that value before gridding.
 
+`Grid()` is not sticky. It guarantees the row set of the frame it returns, but later layers are still allowed to change that row set. For example, `Where(...)` can filter grid-created rows and `Aggregate(...)` only groups rows that survive upstream filters. For flag-based metrics such as `Metric("close")` and `Metric("open")`, gridding the raw source first does not keep missing minutes: grid-created rows have null `is_last` / `is_first`, and those null flags are treated as false by the metric filter.
+
+To produce a complete minute panel where missing close/open bars remain as null values, grid the metric output:
+
+```python
+close_panel = Grid()(Metric("close", Source("trades_tbar")))
+```
+
+Use `Metric("close", Grid()(Source("trades_tbar")))` only when you intentionally want `close` to be computed from real `is_last=True` rows and are fine with missing minutes disappearing before the final output.
+
 ## FillNull
 
 ```python

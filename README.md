@@ -106,6 +106,7 @@ grid_volume = Metric("volume", gridded_raw)
 volume_grid = Grid()(volume)
 volume_5m_auto_grid = Grid()(Aggregate("5m", "sum", value_col="volume")(volume))
 volume_5m_grid = Grid("5m")(Aggregate("5m", "sum", value_col="volume")(volume))
+close_grid = Grid()(Metric("close", raw))
 daily_vwap = Aggregate("1d", "mean", value_col="vwap", alias="daily_vwap")(vwap)
 features = Join(how="left", on=("date", "secu_code"))({
     "minute_volume": grid_volume,
@@ -115,6 +116,8 @@ features = Join(how="left", on=("date", "secu_code"))({
 row_amount = (Col("price") * Col("volume")).alias("amount")(raw)
 preclose = FillNull("state")(Metric("preclose", raw))
 ```
+
+`Grid()` 只保证当前 frame 的 row set，不会 sticky 到所有下游 layer。`Where(...)`、`Metric(...)`、`Aggregate(...)` 仍然可以改变 row set。尤其是 `Metric("close")` / `Metric("open")` 会先按 `is_last` / `is_first` 过滤，grid 补出来的缺失分钟这些 flag 是 null，会被当成 false，所以 `Metric("close", Grid()(raw))` 会把缺失分钟过滤掉。若目标是完整分钟面板，并希望缺失 bar 的 close/open 保持为 null，请使用 `Grid()(Metric("close", raw))`。
 
 ## Rolling 语义
 

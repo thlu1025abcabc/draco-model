@@ -34,6 +34,14 @@ Expand a named market metric into its semantic DAG recipe.
 
 `amount` always uses `price * volume`, even if the raw source contains an `amount` column.
 
+`open` and `close` are flag-based metrics. They first filter rows by `is_first` or `is_last`, then aggregate the surviving prices. Null flags are treated as false. If the input frame was created by `Grid()(Source(...))`, missing source minutes have null `price`, `is_first`, and `is_last`; `Metric("close", gridded_source)` therefore filters those rows out instead of returning a null close row.
+
+For a complete minute panel with null close/open values on missing bars, grid after the metric:
+
+```python
+close_panel = Grid()(Metric("close", raw))
+```
+
 `preclose` cannot be evaluated directly:
 
 ```python
