@@ -61,4 +61,6 @@ Known sources use fixed schemas for stable planning:
 
 Extra normalized columns are intentionally dropped by the `Source` executor. Missing fixed-contract columns raise a clear `ValueError` that includes the source, date, missing columns, and actual normalized columns.
 
-Unknown sources fall back to `scan().collect_schema()` and use their actual normalized columns.
+Unknown sources fall back to `scan().collect_schema()` and use their actual normalized columns. Every source must expose identity keys: either registered fixed keys, or the standard key columns (`date`, `secu_code`, `minute`) or (`date`, `secu_code`) present in the normalized schema. Sources without identity keys raise a `ValueError`.
+
+The trading calendar file `external/trading_days.parquet` must contain a `date` or `trading_day` column.

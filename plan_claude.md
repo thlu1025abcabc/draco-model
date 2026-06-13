@@ -176,3 +176,25 @@ mermaid 里找不到自己命名的步骤,且无任何提示。
 
 - 测试:同结构冲突命名抛 ValueError,信息含两个名字。
 - 测试:匿名节点在前、同结构命名节点在后,`Model.nodes()` / trace 仍显示显式名。
+
+---
+
+## 7. 行为级兜底改为显式报错(2026-06-13 决定)
+
+状态:已修复。三处静默兜底全部改为 ValueError:
+
+- `TradingCalendar.from_data_root`:日历文件列名不再回退到第一列,
+  必须含 `date` 或 `trading_day`。
+- `Engine._infer_info`:op 未注册 info builder 时不再"求值 + collect_schema 反推",
+  直接报错要求 `register_info`。
+- `SourceCatalog.identity_keys`:推断不出 identity 的 source 不再返回 `()`,
+  必须有固定注册键或标准键列(`date`/`secu_code`[/`minute`])。
+
+同批删除的死兜底(`from_columns` 不变量保证不可达):
+`aggregate_value_columns` 的全列扫描分支、`FrameInfo.field_for` /
+`_renamed_field` / passthrough payload 的裸 FieldInfo 默认值。
+
+测试:`test_trading_calendar_requires_known_date_column`、
+`test_infer_info_requires_registered_info_builder`、
+`test_unknown_source_without_key_columns_rejects_identity`。
+文档:docs/user-guide/data-sources.md 补充 identity 契约与日历列要求。

@@ -1174,3 +1174,12 @@ def test_duplicate_structure_keeps_explicit_name() -> None:
     names = resolve_node_names(Model("duplicate_structure", "ex2kamt", combined).nodes())
 
     assert "raw_trades" in names.values()
+
+
+def test_infer_info_requires_registered_info_builder(sample_root: Path) -> None:
+    node = Node(kind="frame", op="executor_only_test_frame", params={})
+    engine = Engine(data_root=sample_root)
+    engine._ensure_calendar()
+
+    with pytest.raises(ValueError, match="frame-info builder"):
+        engine._infer_info(Model("executor_only", "ex2kamt", node), node, "20170103")

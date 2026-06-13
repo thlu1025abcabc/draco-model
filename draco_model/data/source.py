@@ -51,7 +51,10 @@ class SourceCatalog:
             return KEY_COLUMNS
         if all(column in columns for column in DAILY_KEY_COLUMNS):
             return DAILY_KEY_COLUMNS
-        return ()
+        raise ValueError(
+            f"Source {source!r} has no identity keys: register fixed keys or include the standard "
+            f"key columns {KEY_COLUMNS} or {DAILY_KEY_COLUMNS}. Normalized columns: {list(columns)}."
+        )
 
     def _scan_date(self, source: str, date: str) -> pl.LazyFrame:
         key = (source, date)

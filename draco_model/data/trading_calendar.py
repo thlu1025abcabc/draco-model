@@ -27,9 +27,15 @@ class TradingCalendar:
                 f"Trading calendar file is required but missing: {path}"
             )
         frame = pl.read_parquet(path)
-        column = "date" if "date" in frame.columns else "trading_day"
-        if column not in frame.columns:
-            column = frame.columns[0]
+        if "date" in frame.columns:
+            column = "date"
+        elif "trading_day" in frame.columns:
+            column = "trading_day"
+        else:
+            raise ValueError(
+                f"Trading calendar file {path} must contain a 'date' or 'trading_day' column; "
+                f"got columns {frame.columns}."
+            )
         return cls(str(value) for value in frame[column].to_list())
 
     def previous_sessions(self, eval_date: str, lookback_days: int) -> list[str]:

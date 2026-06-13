@@ -176,10 +176,11 @@ class Engine:
         }
         context = self._context(model, eval_date)
         builder = get_info_builder(node.op)
-        if builder is not None:
-            info = builder(node, parent_infos, context)
-        else:
-            info = FrameInfo.from_columns(tuple(self._eval(model, node, eval_date).collect_schema().names()))
+        if builder is None:
+            raise ValueError(
+                f"Node op {node.op!r} has no registered frame-info builder; register one with register_info."
+            )
+        info = builder(node, parent_infos, context)
         self._info_memo[key] = info
         return info
 
