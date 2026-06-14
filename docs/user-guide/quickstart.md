@@ -28,7 +28,7 @@ engine = Engine(data_root="data")
 minute_close = engine.evaluate(model, close, "20170103").collect()
 ```
 
-Use `Engine.collect()` only for final factor output. The model output must be daily grain and must contain a public `value` column.
+Use `Engine.collect()` only for final factor output. The model output must be daily grain and must contain the requested public output columns; by default that list is `["value"]`. Pass `output_columns=[...]` to collect multiple final columns as long-form factors.
 
 ## Trace a Model
 

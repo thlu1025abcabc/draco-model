@@ -29,10 +29,11 @@ df = Engine(data_root="data").collect(model, dates=["20170103"])
 - `Project()` 显式丢弃 internal payload，只保留 key columns + public fields。
 - `FillNull(value)` 支持固定数值、`"ffill"` 和 `"state"`；`"state"` 使用 field 的 `FieldInfo.source` 和 `grain_path` 构造同粒度 close_state，并对齐待填 frame 的 key 后填 public field。`FillNull()` 后会丢弃 old payload。
 - `profile_plan(models)` 静态分析一组 model 的共享 structural nodes，并标记适合 batch materialization 的 cache candidate。
+- `Engine.collect_many(models, dates, ...)` 批量收集多个 model，并用 batch-scoped materialized cache 复用共享 DAG 节点；输出仍是标准长表。
 
 使用建议：`Source(...)` 不会自动补 grid，但如果 raw/minute source 后续要和 daily feature 或其他粒度横向组合，优先显式套一层 `Grid()`。这样下游节点都落在统一的 `(date, secu_code, minute)` grid 上，能减少 mixed-grain `Join()` 的歧义。
 
-`Engine.collect()` 只接受日频 factor 输出：输出必须是 `(date, secu_code)` grain，并包含 public `value` column。分钟级结果请先显式 `Aggregate("1d", ..., alias="value")`，或直接用 `Engine.evaluate()` / `Engine.trace()` 查看。
+`Engine.collect()` 只接受日频 factor 输出：输出必须是 `(date, secu_code)` grain，并包含 requested public output columns。默认输出列是 `["value"]`；也可以传 `output_columns=["value1", "value2"]`，在最后格式化时展开成长表。分钟级结果请先显式 `Aggregate("1d", ...)`，或直接用 `Engine.evaluate()` / `Engine.trace()` 查看。
 
 除非显式运行 `Project()`，其他 layer 默认保留 internal payload；`Aggregate(apply_to="field")` 和 `FillNull()` 是例外，它们会在计算后自动投影到 key columns + public fields。
 Payload 的当前特性：
@@ -65,6 +66,8 @@ events = profiler.to_frame()
 ```
 
 `profile_plan()` 用 structural node id 统计一组 model 中重复出现的子图，适合给后续 batch planner / cache 策略写稳定测试。`Engine.profiler()` 只记录 `collect`、`evaluate`、`infer_info`、`eval` 和最终 materialize 的事件、耗时与 cache hit/miss，不会像 `trace()` 那样 materialize 每个中间节点。
+
+`Engine.collect_many()` 先按 universe 构建 logical union profile，再按 model/date 正常 demand-driven 执行；当一个节点满足 `min_cache_ref_count` 且 op 不在 `exclude_cache_ops` 中时，第一次使用会 materialize 到 batch cache，后续 model 直接复用。默认 `exclude_cache_ops=("source",)`，避免把 raw source eagerly materialize。
 
 ## 文档
 

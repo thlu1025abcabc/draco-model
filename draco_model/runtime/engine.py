@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
-from typing import Callable, Iterator
+from typing import Callable, Iterable, Iterator
 
 import polars as pl
 
@@ -16,16 +18,28 @@ from draco_model.market.minute_calendar import MinuteCalendar
 from draco_model.runtime.execution import (
     can_collect,
     EvalContext,
+    FactorOutputColumns,
     FrameInfo,
     TraceStep,
     format_factor_output,
     get_executor,
     get_info_builder,
+    normalize_factor_output_columns,
 )
-from draco_model.runtime.profiling import PlanProfile, Profiler, profile_plan
+from draco_model.runtime.profiling import DEFAULT_EXCLUDE_CACHE_OPS, PlanProfile, Profiler, profile_plan
 
 
 logger = logging.getLogger(__name__)
+
+BatchCacheKey = tuple[str, str, str]
+
+
+@dataclass
+class _BatchScope:
+    candidates: set[BatchCacheKey]
+    frames: dict[BatchCacheKey, pl.DataFrame] = field(default_factory=dict)
+    lazy_frames: dict[BatchCacheKey, pl.LazyFrame] = field(default_factory=dict)
+    in_progress: set[BatchCacheKey] = field(default_factory=set)
 
 
 class Engine:
@@ -49,17 +63,65 @@ class Engine:
         self._grid_memory: dict[tuple[str, str, tuple[int, ...]], pl.DataFrame] = {}
         self._profiler: Profiler | None = None
 
-    def collect(self, model: Model, dates: list[str] | tuple[str, ...]) -> pl.DataFrame:
+    def collect(
+        self,
+        model: Model,
+        dates: list[str] | tuple[str, ...],
+        *,
+        output_columns: FactorOutputColumns = None,
+    ) -> pl.DataFrame:
         """Evaluate a model output for dates and collect daily factor rows."""
+        normalized_output_columns = normalize_factor_output_columns(output_columns)
         with self._profile_span(
             "collect",
             model=model.name,
             universe=model.universe,
             dates=tuple(_normalize_date(date) for date in dates),
+            output_columns=normalized_output_columns,
         ):
-            return self._collect(model, dates)
+            return self._collect(model, dates, normalized_output_columns)
 
-    def _collect(self, model: Model, dates: list[str] | tuple[str, ...]) -> pl.DataFrame:
+    def collect_many(
+        self,
+        models: list[Model] | tuple[Model, ...],
+        dates: list[str] | tuple[str, ...],
+        *,
+        output_columns: FactorOutputColumns = None,
+        min_cache_ref_count: int = 2,
+        exclude_cache_ops: Iterable[str] = DEFAULT_EXCLUDE_CACHE_OPS,
+    ) -> pl.DataFrame:
+        """Evaluate multiple models with batch-scoped materialized cache reuse."""
+        model_list = list(models)
+        if not model_list:
+            raise ValueError("Engine.collect_many requires at least one model.")
+        if not dates:
+            raise ValueError("Engine.collect_many requires at least one date.")
+        _validate_unique_model_names(model_list)
+        normalized_output_columns = normalize_factor_output_columns(output_columns)
+        normalized_dates = tuple(_normalize_date(date) for date in dates)
+        excluded_ops = tuple(exclude_cache_ops)
+        with self._profile_span(
+            "collect_many",
+            models=tuple(model.name for model in model_list),
+            dates=normalized_dates,
+            output_columns=normalized_output_columns,
+            min_cache_ref_count=min_cache_ref_count,
+            exclude_cache_ops=excluded_ops,
+        ):
+            return self._collect_many(
+                model_list,
+                normalized_dates,
+                normalized_output_columns,
+                min_cache_ref_count,
+                excluded_ops,
+            )
+
+    def _collect(
+        self,
+        model: Model,
+        dates: list[str] | tuple[str, ...],
+        output_columns: tuple[str, ...],
+    ) -> pl.DataFrame:
         if not dates:
             raise ValueError("Engine.collect requires at least one date.")
         t0 = perf_counter()
@@ -76,15 +138,16 @@ class Engine:
             logger.debug("collect.date.start model=%s date=%s", model.name, date)
             self._grid_memory.clear()
             info = self._infer_info(model, model.output, date)
-            _validate_collect_info(info)
+            _validate_collect_info(info, output_columns)
             frame = self.evaluate(model, model.output, date)
-            outputs.append(format_factor_output(frame, model.name, date))
+            outputs.append(format_factor_output(frame, model.name, date, output_columns))
             logger.debug("collect.date.done model=%s date=%s", model.name, date)
         with self._profile_span(
             "collect.materialize",
             model=model.name,
             universe=model.universe,
             dates=tuple(normalized_dates),
+            output_columns=output_columns,
         ):
             result = pl.concat(outputs, how="vertical").collect()
         logger.info(
@@ -157,9 +220,19 @@ class Engine:
         logger.info("trace.done model=%s universe=%s date=%s steps=%d", model.name, model.universe, eval_date, len(steps))
         return steps
 
-    def profile_plan(self, models: list[Model] | tuple[Model, ...]) -> PlanProfile:
+    def profile_plan(
+        self,
+        models: list[Model] | tuple[Model, ...],
+        *,
+        min_cache_ref_count: int = 2,
+        exclude_cache_ops: Iterable[str] = DEFAULT_EXCLUDE_CACHE_OPS,
+    ) -> PlanProfile:
         """Return a static shared-node profile for a group of models."""
-        return profile_plan(models)
+        return profile_plan(
+            models,
+            min_cache_ref_count=min_cache_ref_count,
+            exclude_cache_ops=exclude_cache_ops,
+        )
 
     @contextmanager
     def profiler(self) -> Iterator[Profiler]:
@@ -176,6 +249,65 @@ class Engine:
         if self.trading_calendar is None:
             logger.debug("calendar.load data_root=%s", self.data_root)
             self.trading_calendar = TradingCalendar.from_data_root(self.data_root)
+
+    def _collect_many(
+        self,
+        models: list[Model],
+        dates: tuple[str, ...],
+        output_columns: tuple[str, ...],
+        min_cache_ref_count: int,
+        exclude_cache_ops: tuple[str, ...],
+    ) -> pl.DataFrame:
+        t0 = perf_counter()
+        self._ensure_calendar()
+        models_by_universe = _models_by_universe(models)
+        scope = _BatchScope(
+            candidates=_batch_cache_candidates(
+                models_by_universe,
+                dates,
+                min_cache_ref_count=min_cache_ref_count,
+                exclude_cache_ops=exclude_cache_ops,
+            )
+        )
+        self._profile_record(
+            "collect_many.plan",
+            model_count=len(models),
+            date_count=len(dates),
+            candidate_count=len(scope.candidates),
+            min_cache_ref_count=min_cache_ref_count,
+            exclude_cache_ops=exclude_cache_ops,
+        )
+        logger.info(
+            "collect_many.start models=%d dates=%s cache_candidates=%d",
+            len(models),
+            list(dates),
+            len(scope.candidates),
+        )
+        outputs: list[pl.LazyFrame] = []
+        for date in dates:
+            self._grid_memory.clear()
+            for model in models:
+                logger.debug("collect_many.model.start model=%s date=%s", model.name, date)
+                info = self._infer_info(model, model.output, date)
+                _validate_collect_info(info, output_columns)
+                frame = self._eval_batch(model, model.output, date, scope)
+                outputs.append(format_factor_output(frame, model.name, date, output_columns))
+                logger.debug("collect_many.model.done model=%s date=%s", model.name, date)
+        with self._profile_span(
+            "collect_many.materialize",
+            models=tuple(model.name for model in models),
+            dates=dates,
+            output_columns=output_columns,
+        ):
+            result = pl.concat(outputs, how="vertical").collect()
+        logger.info(
+            "collect_many.done models=%d dates=%s rows=%d elapsed=%.3fs",
+            len(models),
+            list(dates),
+            result.height,
+            perf_counter() - t0,
+        )
+        return result
 
     def _context(self, model: Model, eval_date: str, *, evaluate: Callable[[Node], pl.LazyFrame] | None = None) -> EvalContext:
         assert self.trading_calendar is not None
@@ -226,6 +358,93 @@ class Engine:
 
         self._memory[key] = out
         return out
+
+    def _eval_batch(self, model: Model, node: Node, eval_date: str, scope: _BatchScope) -> pl.LazyFrame:
+        key = (model.universe, node.id, eval_date)
+        if key in scope.frames:
+            frame = scope.frames[key]
+            self._profile_record(
+                "batch_cache.hit",
+                model=model.name,
+                universe=model.universe,
+                date=eval_date,
+                node_id=node.id,
+                op=node.op,
+                rows=frame.height,
+                columns=len(frame.columns),
+            )
+            return frame.lazy()
+        if key in scope.lazy_frames and key not in scope.candidates:
+            self._profile_record(
+                "eval.cache_hit",
+                model=model.name,
+                universe=model.universe,
+                date=eval_date,
+                node_id=node.id,
+                op=node.op,
+            )
+            return scope.lazy_frames[key]
+
+        if key in scope.candidates and key not in scope.in_progress:
+            self._profile_record(
+                "batch_cache.miss",
+                model=model.name,
+                universe=model.universe,
+                date=eval_date,
+                node_id=node.id,
+                op=node.op,
+            )
+            scope.in_progress.add(key)
+            try:
+                lazy = self._execute_node_batch(model, node, eval_date, scope)
+                start = perf_counter()
+                frame = lazy.collect()
+                self._profile_record(
+                    "batch_cache.materialize",
+                    elapsed_ms=(perf_counter() - start) * 1000,
+                    model=model.name,
+                    universe=model.universe,
+                    date=eval_date,
+                    node_id=node.id,
+                    op=node.op,
+                    rows=frame.height,
+                    columns=len(frame.columns),
+                )
+                scope.frames[key] = frame
+                return frame.lazy()
+            finally:
+                scope.in_progress.remove(key)
+
+        lazy = self._execute_node_batch(model, node, eval_date, scope)
+        if key not in scope.candidates:
+            scope.lazy_frames[key] = lazy
+        return lazy
+
+    def _execute_node_batch(self, model: Model, node: Node, eval_date: str, scope: _BatchScope) -> pl.LazyFrame:
+        self._profile_record(
+            "eval.cache_miss",
+            model=model.name,
+            universe=model.universe,
+            date=eval_date,
+            node_id=node.id,
+            op=node.op,
+        )
+        with self._profile_span(
+            "eval",
+            model=model.name,
+            universe=model.universe,
+            date=eval_date,
+            node_id=node.id,
+            op=node.op,
+        ):
+            return get_executor(node.op)(
+                node,
+                self._context(
+                    model,
+                    eval_date,
+                    evaluate=lambda parent: self._eval_batch(model, parent, eval_date, scope),
+                ),
+            )
 
     def _infer_info(self, model: Model, node: Node, eval_date: str) -> FrameInfo:
         key = (model.universe, node.id, eval_date)
@@ -290,9 +509,48 @@ def _normalize_date(value: object) -> str:
     return str(value).replace("-", "")
 
 
-def _validate_collect_info(info: FrameInfo) -> None:
-    if not can_collect(info):
+def _validate_unique_model_names(models: list[Model]) -> None:
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for model in models:
+        if model.name in seen:
+            duplicates.append(model.name)
+        seen.add(model.name)
+    if duplicates:
+        raise ValueError(f"Engine.collect_many requires unique model names, got duplicates: {duplicates}.")
+
+
+def _models_by_universe(models: list[Model]) -> dict[str, list[Model]]:
+    out: dict[str, list[Model]] = defaultdict(list)
+    for model in models:
+        out[model.universe].append(model)
+    return dict(out)
+
+
+def _batch_cache_candidates(
+    models_by_universe: dict[str, list[Model]],
+    dates: tuple[str, ...],
+    *,
+    min_cache_ref_count: int,
+    exclude_cache_ops: Iterable[str],
+) -> set[BatchCacheKey]:
+    out: set[BatchCacheKey] = set()
+    for universe, models in models_by_universe.items():
+        plan = profile_plan(
+            models,
+            min_cache_ref_count=min_cache_ref_count,
+            exclude_cache_ops=exclude_cache_ops,
+        )
+        for node in plan.cache_candidates():
+            for date in dates:
+                out.add((universe, node.node_id, date))
+    return out
+
+
+def _validate_collect_info(info: FrameInfo, output_columns: tuple[str, ...]) -> None:
+    if not can_collect(info, output_columns):
         raise ValueError(
-            "Engine.collect requires a daily output with date/secu_code keys; "
-            f"got grain={info.grain!r}, keys={info.keys!r}."
+            "Engine.collect requires a daily output with date/secu_code keys and requested public output columns; "
+            f"got grain={info.grain!r}, keys={info.keys!r}, "
+            f"requested={list(output_columns)!r}, available={info.value_columns()!r}."
         )

@@ -27,13 +27,15 @@ for step in engine.trace(model, "20170103"):
 ```python
 from draco_model import profile_plan
 
-profile = profile_plan([amount_model, vwap_model])
+profile = profile_plan([amount_model, vwap_model], min_cache_ref_count=2)
 
 for node in profile.cache_candidates():
-    print(node.op, node.params, node.ref_count, node.models)
+    print(node.op, node.params, node.ref_count, node.models, node.cache_reason)
 ```
 
 `profile_plan()` is a static analysis pass. It does not scan parquet files or execute Polars plans. Use it to identify structural nodes shared by multiple models and to write stable tests for future batch-planner cache behavior.
+
+By default, `source` nodes are excluded from materialized cache candidates. Pass `exclude_cache_ops=...` to inspect a different policy.
 
 ## Profile Runtime Events
 
@@ -48,6 +50,15 @@ print(profiler.to_frame())
 ```
 
 The runtime profiler records events around the normal `collect()` path, including `infer_info`, `eval`, cache hit/miss, and final materialization spans. It does not materialize intermediate nodes.
+
+For batch runs, `collect_many()` emits additional `batch_cache.miss`, `batch_cache.materialize`, and `batch_cache.hit` events:
+
+```python
+with engine.profiler() as profiler:
+    engine.collect_many([amount_model, vwap_model], ["20170103"])
+
+events = profiler.to_frame()
+```
 
 ## Render Mermaid
 

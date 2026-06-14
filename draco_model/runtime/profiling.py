@@ -12,13 +12,7 @@ import polars as pl
 from draco_model.core import Model, Node
 
 
-_CACHE_CANDIDATE_OPS = {
-    "_grid_project",
-    "aggregate",
-    "fill_null",
-    "join",
-    "op",
-}
+DEFAULT_EXCLUDE_CACHE_OPS = ("source",)
 
 
 @dataclass(frozen=True)
@@ -35,6 +29,7 @@ class PlanNodeProfile:
     depth: int
     is_shared: bool
     cache_candidate: bool
+    cache_reason: str
 
 
 @dataclass(frozen=True)
@@ -74,6 +69,7 @@ class PlanProfile:
                     "depth": node.depth,
                     "is_shared": node.is_shared,
                     "cache_candidate": node.cache_candidate,
+                    "cache_reason": node.cache_reason,
                 }
                 for node in self.nodes
             ]
@@ -159,9 +155,17 @@ class Profiler:
         )
 
 
-def profile_plan(models: Iterable[Model]) -> PlanProfile:
+def profile_plan(
+    models: Iterable[Model],
+    *,
+    min_cache_ref_count: int = 2,
+    exclude_cache_ops: Iterable[str] = DEFAULT_EXCLUDE_CACHE_OPS,
+) -> PlanProfile:
     """Build a static profile of shared structural nodes across models."""
+    if min_cache_ref_count < 1:
+        raise ValueError("min_cache_ref_count must be >= 1.")
     model_list = list(models)
+    excluded_ops = frozenset(exclude_cache_ops)
     nodes_by_id: dict[str, Node] = {}
     models_by_id: dict[str, set[str]] = defaultdict(set)
     ref_counts: Counter[str] = Counter()
@@ -187,14 +191,24 @@ def profile_plan(models: Iterable[Model]) -> PlanProfile:
                 ref_counts[node_id],
                 tuple(sorted(models_by_id[node_id])),
                 depths[node_id],
+                min_cache_ref_count,
+                excluded_ops,
             )
             for node_id in order
         )
     )
 
 
-def _plan_node_profile(node: Node, ref_count: int, models: tuple[str, ...], depth: int) -> PlanNodeProfile:
+def _plan_node_profile(
+    node: Node,
+    ref_count: int,
+    models: tuple[str, ...],
+    depth: int,
+    min_cache_ref_count: int,
+    exclude_cache_ops: frozenset[str],
+) -> PlanNodeProfile:
     is_shared = ref_count > 1
+    cache_candidate, cache_reason = _cache_decision(node, ref_count, min_cache_ref_count, exclude_cache_ops)
     return PlanNodeProfile(
         node_id=node.id,
         kind=node.kind,
@@ -205,8 +219,24 @@ def _plan_node_profile(node: Node, ref_count: int, models: tuple[str, ...], dept
         models=models,
         depth=depth,
         is_shared=is_shared,
-        cache_candidate=is_shared and node.kind == "frame" and node.op in _CACHE_CANDIDATE_OPS,
+        cache_candidate=cache_candidate,
+        cache_reason=cache_reason,
     )
+
+
+def _cache_decision(
+    node: Node,
+    ref_count: int,
+    min_cache_ref_count: int,
+    exclude_cache_ops: frozenset[str],
+) -> tuple[bool, str]:
+    if node.kind != "frame":
+        return False, "skipped: non-frame node"
+    if ref_count < min_cache_ref_count:
+        return False, f"skipped: ref_count {ref_count} < {min_cache_ref_count}"
+    if node.op in exclude_cache_ops:
+        return False, f"skipped: excluded op {node.op}"
+    return True, f"selected: ref_count {ref_count} >= {min_cache_ref_count}"
 
 
 def _node_depth(node: Node, local_depths: dict[str, int]) -> int:

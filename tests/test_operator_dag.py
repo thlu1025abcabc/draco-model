@@ -839,6 +839,67 @@ def test_collect_daily_output(sample_root: Path) -> None:
     }
 
 
+def test_collect_accepts_custom_single_output_column(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    output = Aggregate("1d", "sum", value_col="amount", alias="amount")(metric("amount")(raw))
+    result = Engine(data_root=sample_root).collect(
+        Model("daily_amount", "ex2kamt", output),
+        dates=["20170103"],
+        output_columns=["amount"],
+    )
+
+    assert result.to_dict(as_series=False) == {
+        "date": ["20170103"],
+        "secu_code": [1],
+        "factor_name": ["daily_amount"],
+        "value": [880.0],
+    }
+
+
+def test_collect_unpivots_multiple_output_columns(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    amount = Aggregate("1d", "sum", value_col="amount", alias="amount")(metric("amount")(raw))
+    volume = Aggregate("1d", "sum", value_col="volume", alias="volume")(metric("volume")(raw))
+    output = Join()({"amount": amount, "volume": volume})
+
+    result = Engine(data_root=sample_root).collect(
+        Model("trade_totals", "ex2kamt", output),
+        dates=["20170103"],
+        output_columns=["amount", "volume"],
+    )
+
+    assert result.to_dict(as_series=False) == {
+        "date": ["20170103", "20170103"],
+        "secu_code": [1, 1],
+        "factor_name": ["trade_totals__amount", "trade_totals__volume"],
+        "value": [880.0, 85.0],
+    }
+
+
+def test_collect_rejects_unknown_output_column(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    output = Aggregate("1d", "sum", value_col="amount", alias="amount")(metric("amount")(raw))
+
+    with pytest.raises(ValueError, match="requested"):
+        Engine(data_root=sample_root).collect(
+            Model("daily_amount", "ex2kamt", output),
+            dates=["20170103"],
+            output_columns=["missing"],
+        )
+
+
+def test_collect_rejects_scalar_output_columns(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    output = Aggregate("1d", "sum", value_col="amount", alias="amount")(metric("amount")(raw))
+
+    with pytest.raises(TypeError, match="list or tuple"):
+        Engine(data_root=sample_root).collect(
+            Model("daily_amount", "ex2kamt", output),
+            dates=["20170103"],
+            output_columns="amount",  # type: ignore[arg-type]
+        )
+
+
 def test_collect_emits_run_logging(sample_root: Path, caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="draco_model.runtime.engine")
     raw = Source("trades_tbar")
