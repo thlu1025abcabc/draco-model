@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from draco_model import Engine, Model
-from draco_model.layers import Aggregate, Join, Metric, Source, TopQuantile, Where
+from draco_model.layers import Aggregate, Join, Source, TopQuantile, Where
+from draco_model.recipes import metric
 
 
 DATA_ROOT = Path("data")
@@ -12,8 +13,8 @@ DATE = "20170103"
 
 raw = Source("trades_tbar")
 features = Join()({
-    "close": Metric("close", raw),
-    "volume": Metric("volume", raw),
+    "close": metric("close")(raw),
+    "volume": metric("volume")(raw),
 })
 filtered = Where(TopQuantile("volume", q=0.8, over=["date", "secu_code"]))(features)
 output = Aggregate("1d", "mean", value_col="close", alias="value")(filtered)

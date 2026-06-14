@@ -64,9 +64,9 @@ nav:
       - Overview: api/index.md
       - Engine: api/engine.md
       - Model, Node, and TraceStep: api/model.md
+      - Recipes and Shortcuts: api/recipes.md
       - Layers:
           - Source: api/layers/source.md
-          - Metric: api/layers/metrics.md
           - Operators: api/layers/operators.md
           - Filters: api/layers/filters.md
           - Aggregate: api/layers/aggregate.md

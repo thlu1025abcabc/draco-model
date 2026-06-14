@@ -6,17 +6,18 @@ This page shows the shortest path from a raw market source to a daily factor out
 
 ```python
 from draco_model import Engine, Model
-from draco_model.layers import Aggregate, Metric, Source
+from draco_model.recipes import metric
+from draco_model.layers import Aggregate, Source
 
 raw = Source("trades_tbar")
-close = Metric("close", raw)
+close = metric("close")(raw)
 output = Aggregate("1d", "last", value_col="close", alias="value")(close)
 
 model = Model(name="close_last", universe="ex2kamt", output=output)
 df = Engine(data_root="data").collect(model, dates=["20170103"])
 ```
 
-`Metric("close", raw)` expands into a real DAG. It is not a black-box field executor. You can inspect that DAG with `model.nodes()` or `model.explain_mermaid()`.
+`metric("close")(raw)` expands into a real DAG. It is not a black-box field executor. You can inspect that DAG with `model.nodes()` or `model.explain_mermaid()`.
 
 ## Evaluate Intermediate Nodes
 

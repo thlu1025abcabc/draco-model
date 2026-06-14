@@ -3,10 +3,11 @@
 `Aggregate` handles raw-to-minute aggregation, minute resampling, daily aggregation, and auction handling.
 
 ```python
-from draco_model.layers import Aggregate, Metric, Source
+from draco_model.recipes import metric
+from draco_model.layers import Aggregate, Source
 
 raw = Source("trades_tbar")
-volume = Metric("volume", raw)
+volume = metric("volume")(raw)
 
 volume_5m = Aggregate("5m", "sum", value_col="volume")(volume)
 daily_value = Aggregate("1d", "sum", value_col="volume", alias="value")(volume)
@@ -45,8 +46,8 @@ Daily aggregation applies the auction policy before daily grouping.
 `apply_to="components"` aggregates operator components separately, then recomputes the public output. This requires aggregatable components and is not available after `FillNull()`. It is important for ratio-like fields such as vwap:
 
 ```python
-amount = Metric("amount", raw)
-volume = Metric("volume", raw)
+amount = metric("amount")(raw)
+volume = metric("volume")(raw)
 vwap = (amount / volume).alias("vwap")
 
 vwap_5m = Aggregate("5m", "sum", apply_to="components")(vwap)

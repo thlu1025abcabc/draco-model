@@ -3,11 +3,12 @@
 Rolling operators are created with `Op(...)`.
 
 ```python
-from draco_model.layers import Metric, Op, Source
+from draco_model.recipes import metric
+from draco_model.layers import Op, Source
 
 raw = Source("trades_tbar", lookback_days=5)
-amount = Metric("amount", raw)
-volume = Metric("volume", raw)
+amount = metric("amount")(raw)
+volume = metric("volume")(raw)
 
 corr = Op("rolling_corr", amount, volume, window=5, alias="corr_5")
 cross_day = Op("rolling_corr", amount, volume, window=5, alias="corr_5_cross", cross_day=True)

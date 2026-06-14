@@ -4,10 +4,11 @@
 
 ```python
 from draco_model import Engine, Model
-from draco_model.layers import Aggregate, Metric, Source
+from draco_model.recipes import metric
+from draco_model.layers import Aggregate, Source
 
 raw = Source("trades_tbar")
-close = Metric("close", raw)
+close = metric("close")(raw)
 output = Aggregate("1d", "last", value_col="close", alias="value")(close)
 
 model = Model(name="close_last", universe="ex2kamt", output=output)
@@ -17,7 +18,7 @@ df = Engine(data_root="data").collect(model, dates=["20170103"])
 ## 核心 API
 
 - `Source("trades_tbar")` 扫描一个 raw source，不自动补 intraday grid。
-- `Metric("name", raw)` 是字段 recipe shorthand；它会展开成真实 DAG。
+- `metric("name")(raw)` 是字段 recipe shorthand；它会展开成真实 DAG。
 - `Col("price")` 是 raw column reference，只能应用到 frame 上，例如 `(Col("price") * Col("volume")).alias("amount")(raw)`。
 - `Op("name", ...)` 是统一 operator 入口，支持 `add/sub/mul/div/rolling_corr/rolling_beta/rolling_alpha`。
 - `Node` 和 `Col` 支持 magic arithmetic：`+ - * /` 都会生成 `op` 节点。
@@ -49,7 +50,7 @@ Public alias 和 `Join()` input name 不能以 `__` 开头，也不能使用 `da
 更完整的 user guide 和 API reference 放在 [docs/index.md](docs/index.md)。文档按 sklearn / Polars 风格拆成 narrative guide 与 API reference 两层：
 
 - user guide 解释 source schema、aggregation、rolling、payload、debugging 等语义。
-- API reference 覆盖 `Engine`、`Model`、`Source`、`Metric`、`Op`、filters、`Aggregate`、`Grid`、`FillNull`、`Join` 和 `Project`。
+- API reference 覆盖 `Engine`、`Model`、`Source`、`metric`、`Op`、filters、`Aggregate`、`Grid`、`FillNull`、`Join` 和 `Project`。
 
 文档站使用 MkDocs Material：
 
@@ -74,39 +75,40 @@ python -m mkdocs build
 - `SourceCatalog` 负责注册 source 的固定 schema 和 row identity keys；`Aggregate` 等 `group_by` layer 会把输出 identity 改成 group keys。
 - `Join(how="full")` 在 `on=None` 时逐步使用左右 identity keys 的交集；`Join(how="left")` 在 `on=None` 时以最左输入的 identity keys 为 join key。显式 `on` 时按 `on` join，但 `on` 必须是双方 identity key 且覆盖双方共享 identity；输出 identity 都是所有输入 identity keys 的有序并集。`how="full"` 只允许同粒度或全 daily 输入，不允许 daily/minute 混合产生 `minute=null` padding row；混合粒度请使用 `how="left"` 并显式选择 join key。`Grid` 是 system grid source 加 `Join(how="left")` 的 API 应用；raw source 不会自动补 grid，但对 source 显式 `Grid()` 后，下游 feature 会共享统一 minute identity，后续 join 通常更简单。
 
-## Metric Recipes
+## Recipe Shortcuts
 
-内置 `Metric` 语义：
+内置 `metric` 语义：
 
-- `Metric("volume", raw)`：`Col("volume") -> Aggregate("1m", "sum")`。
-- `Metric("no", raw)`：`Col("no") -> Aggregate("1m", "sum")`。`no` 表示 records 数量，不表示价格顺序。
-- `Metric("amount", raw)`：`Col("price") * Col("volume") -> Aggregate("1m", "sum")`。即使 raw source 有 `amount` 列，也固定使用 `price * volume`。
-- `Metric("buyamount", raw)`：`Where(Side("buy")) -> price * volume -> Aggregate("1m", "sum")`。
-- `Metric("sellamount", raw)`：`Where(Side("sell")) -> price * volume -> Aggregate("1m", "sum")`。
-- `Metric("vwap", raw)`：`Metric("amount", raw) / Metric("volume", raw)`。
-- `Metric("open/close")`：分别用 `is_first` / `is_last` 过滤 price 后聚合。
-- `Metric("high/low")`：对 price 做 max/min。
-- `Metric("preclose")`：直接 evaluate 会报错；必须通过 `FillNull("state")(Metric("preclose", raw))` 使用。
+- `metric("volume")(raw)`：`Col("volume") -> Aggregate("1m", "sum")`。
+- `metric("no")(raw)`：`Col("no") -> Aggregate("1m", "sum")`。`no` 表示 records 数量，不表示价格顺序。
+- `metric("amount")(raw)`：`Col("price") * Col("volume") -> Aggregate("1m", "sum")`。即使 raw source 有 `amount` 列，也固定使用 `price * volume`。
+- `metric("buyamount")(raw)`：`Where(Side("buy")) -> price * volume -> Aggregate("1m", "sum")`。
+- `metric("sellamount")(raw)`：`Where(Side("sell")) -> price * volume -> Aggregate("1m", "sum")`。
+- `metric("vwap")(raw)`：`metric("amount")(raw) / metric("volume")(raw)`。
+- `metric("open/close")`：分别用 `is_first` / `is_last` 过滤 price 后聚合。
+- `metric("high/low")`：对 price 做 max/min。
+- `metric("preclose")`：直接 evaluate 会报错；必须通过 `FillNull("state")(metric("preclose")(raw))` 使用。
 
 示例：
 
 ```python
-from draco_model.layers import Aggregate, Col, FillNull, Grid, Join, Metric, Source
+from draco_model.recipes import metric
+from draco_model.layers import Aggregate, Col, FillNull, Grid, Join, Source
 
 raw = Source("trades_tbar")
 gridded_raw = Grid()(raw)
 
-amount = Metric("amount", raw)
-volume = Metric("volume", raw)
+amount = metric("amount")(raw)
+volume = metric("volume")(raw)
 vwap = (amount / volume).alias("vwap")
 
 vwap_5m = Aggregate("5m", "sum", apply_to="components")(vwap)
 mean_minute_vwap = Aggregate("5m", "mean", apply_to="field")(vwap)
-grid_volume = Metric("volume", gridded_raw)
+grid_volume = metric("volume")(gridded_raw)
 volume_grid = Grid()(volume)
 volume_5m_auto_grid = Grid()(Aggregate("5m", "sum", value_col="volume")(volume))
 volume_5m_grid = Grid("5m")(Aggregate("5m", "sum", value_col="volume")(volume))
-close_grid = Grid()(Metric("close", raw))
+close_grid = Grid()(metric("close")(raw))
 daily_vwap = Aggregate("1d", "mean", value_col="vwap", alias="daily_vwap")(vwap)
 features = Join(how="left", on=("date", "secu_code"))({
     "minute_volume": grid_volume,
@@ -114,10 +116,10 @@ features = Join(how="left", on=("date", "secu_code"))({
 })
 
 row_amount = (Col("price") * Col("volume")).alias("amount")(raw)
-preclose = FillNull("state")(Metric("preclose", raw))
+preclose = FillNull("state")(metric("preclose")(raw))
 ```
 
-`Grid()` 只保证当前 frame 的 row set，不会 sticky 到所有下游 layer。`Where(...)`、`Metric(...)`、`Aggregate(...)` 仍然可以改变 row set。尤其是 `Metric("close")` / `Metric("open")` 会先按 `is_last` / `is_first` 过滤，grid 补出来的缺失分钟这些 flag 是 null，会被当成 false，所以 `Metric("close", Grid()(raw))` 会把缺失分钟过滤掉。若目标是完整分钟面板，并希望缺失 bar 的 close/open 保持为 null，请使用 `Grid()(Metric("close", raw))`。
+`Grid()` 只保证当前 frame 的 row set，不会 sticky 到所有下游 layer。`Where(...)`、`metric(...)(...)`、`Aggregate(...)` 仍然可以改变 row set。尤其是 `metric("close")` / `metric("open")` 会先按 `is_last` / `is_first` 过滤，grid 补出来的缺失分钟这些 flag 是 null，会被当成 false，所以 `metric("close")(Grid()(raw))` 会把缺失分钟过滤掉。若目标是完整分钟面板，并希望缺失 bar 的 close/open 保持为 null，请使用 `Grid()(metric("close")(raw))`。
 
 ## Rolling 语义
 
@@ -125,8 +127,8 @@ preclose = FillNull("state")(Metric("preclose", raw))
 
 ```python
 raw = Source("trades_tbar", lookback_days=5)
-amount = Metric("amount", raw)
-volume = Metric("volume", raw)
+amount = metric("amount")(raw)
+volume = metric("volume")(raw)
 
 intraday_corr = Op("rolling_corr", amount, volume, window=5, alias="corr_5")
 cross_day_corr = Op("rolling_corr", amount, volume, window=5, alias="corr_5_cross", cross_day=True)
@@ -154,7 +156,7 @@ cross_day_corr = Op("rolling_corr", amount, volume, window=5, alias="corr_5_cros
 注意：daily aggregate 的 `auction="merge"` 会在合并 auction bar 和最终 daily 聚合时使用同一个 `agg`。例如 `Aggregate("1d", "mean", auction="merge")` 会先用 `mean` 合并 `925 -> 930` / `1500 -> 1456` 后的同一分钟，再对全天做 `mean`。如果目标语义是“auction volume 先用 `sum` 合入非 auction bar，然后再做 daily `mean`”，需要显式拆成两层：
 
 ```python
-volume_1m = Aggregate("1m", "sum", value_col="volume", auction="merge")(Metric("volume", raw))
+volume_1m = Aggregate("1m", "sum", value_col="volume", auction="merge")(metric("volume")(raw))
 daily_mean = Aggregate("1d", "mean", value_col="volume", alias="value")(volume_1m)
 ```
 
@@ -218,5 +220,5 @@ python -m examples.preclose_fill_state_demo
 ## TODO
 
 - 后续 batch planner 需要合并多个 model / metric 中可复用的 source scan、operator branch 和 join。
-- 后续 optimizer 可以把同 source 的 `Metric("amount")`、`Metric("volume")`、`Metric("vwap")` fuse 成更少的 physical plan。
+- 后续 optimizer 可以把同 source 的 `metric("amount")`、`metric("volume")`、`metric("vwap")` fuse 成更少的 physical plan。
 - 评估是否需要 smart join：根据输入 grain、key 覆盖、source 复用和 public/payload 列需求，减少不必要的宽表 join、重复 scan 或中间 payload 搬运。

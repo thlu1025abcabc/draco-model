@@ -19,7 +19,7 @@ public_only = Project()(frame)
 Arithmetic and rolling operators can produce internal component columns. For a vwap-like field:
 
 ```python
-vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
+vwap = (metric("amount")(raw) / metric("volume")(raw)).alias("vwap")
 ```
 
 The public field is `vwap`, while internal payload stores the operands needed for component aggregation.

@@ -10,8 +10,8 @@ Horizontally align multiple frames by key columns.
 
 ```python
 features = Join()({
-    "close": Metric("close", raw),
-    "volume": Metric("volume", raw),
+    "close": metric("close")(raw),
+    "volume": metric("volume")(raw),
 })
 ```
 
@@ -61,8 +61,8 @@ public_features = Project()(features)
 
 ```python
 joined = Join()({
-    "vwap": Metric("vwap", raw),
-    "close": Metric("close", raw),
+    "vwap": metric("vwap")(raw),
+    "close": metric("close")(raw),
 })
 
 public = Project()(joined)

@@ -8,14 +8,17 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+import draco_model
+import draco_model.layers as layer_api
 import draco_model.runtime.engine as engine_module
-from draco_model import Engine, Model
+from draco_model import Engine, Layer, Model
 from draco_model.core import Node, resolve_node_names
-from draco_model.layers import Aggregate, Col, FillNull, Grid, Join, Metric, Op, Project, Side, Source, Threshold, Where
+from draco_model.layers import Aggregate, Col, FillNull, Grid, Join, Op, Project, Side, Source, Threshold, Where
 from draco_model.layers.aggregate import _auction_merge_targets
 from draco_model.layers.operators import _window_op
 from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
 from draco_model.market.minute_calendar import MinuteCalendar
+from draco_model.recipes import FactorRecipe, Shortcut, metric, transform
 from draco_model.runtime.execution import (
     EvalContext,
     FieldInfo,
@@ -137,8 +140,8 @@ def _test_join_frame_info(node: Node, parent_infos: dict[str, FrameInfo], contex
 
 def test_magic_arithmetic_builds_operator_nodes() -> None:
     raw = Source("trades_tbar")
-    amount = Metric("amount", raw)
-    volume = Metric("volume", raw)
+    amount = metric("amount")(raw)
+    volume = metric("volume")(raw)
     vwap = (amount / volume).alias("vwap")
     row_amount = (Col("price") * Col("volume")).alias("amount")(raw)
 
@@ -150,19 +153,44 @@ def test_magic_arithmetic_builds_operator_nodes() -> None:
     assert row_amount.params["name"] == "mul"
 
 
+def test_metric_shortcut_is_not_a_runtime_layer() -> None:
+    close = metric("close")
+
+    assert isinstance(close, Shortcut)
+    assert not isinstance(close, Layer)
+    assert not isinstance(close, Node)
+    assert not hasattr(layer_api, "Metric")
+    assert draco_model.metric is metric
+    assert draco_model.transform is transform
+    assert draco_model.Shortcut is Shortcut
+    assert draco_model.FactorRecipe is FactorRecipe
+
+
+def test_transform_shortcut_placeholder_requires_registered_transform() -> None:
+    raw = Source("trades_tbar")
+
+    with pytest.raises(ValueError, match="Transform shortcut 'rank' is not registered"):
+        transform("rank")(raw)
+
+
+def test_factor_recipe_placeholder_build_raises() -> None:
+    with pytest.raises(NotImplementedError):
+        FactorRecipe().build()
+
+
 def test_public_aliases_cannot_use_payload_prefix() -> None:
     raw = Source("trades_tbar")
 
     with pytest.raises(ValueError, match="must not start with '__'"):
-        Metric("volume", raw, alias="__volume")
+        metric("volume", alias="__volume")(raw)
     with pytest.raises(ValueError, match="must not start with '__'"):
         Aggregate("1d", "last", value_col="volume", alias="__value")
     with pytest.raises(ValueError, match="must not start with '__'"):
         Col("price").alias("__price")
     with pytest.raises(ValueError, match="must not start with '__'"):
-        Join()({"__volume": Metric("volume", raw)})
+        Join()({"__volume": metric("volume")(raw)})
     with pytest.raises(ValueError, match="must not be a key column"):
-        Metric("volume", raw, alias="minute")
+        metric("volume", alias="minute")(raw)
     with pytest.raises(ValueError, match="must not be a key column"):
         Aggregate("1d", "last", value_col="volume", alias="date")
 
@@ -324,7 +352,7 @@ def test_join_left_allows_explicit_mixed_daily_and_minute_join(sample_root: Path
 
 def test_metric_amount_uses_price_times_volume(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    amount = Metric("amount", raw)
+    amount = metric("amount")(raw)
     model = Model("amount_probe", "ex2kamt", amount)
 
     frame = Engine(data_root=sample_root).evaluate(model, amount, "20170103").collect()
@@ -337,9 +365,9 @@ def test_metric_amount_uses_price_times_volume(sample_root: Path) -> None:
 def test_buyamount_expands_to_side_filter_and_product(tmp_path: Path) -> None:
     _write_market_fixture(tmp_path)
     raw = Source("trades_tbar")
-    buyamount = Metric("buyamount", raw)
-    sellamount = Metric("sellamount", raw)
-    amount = Metric("amount", raw)
+    buyamount = metric("buyamount")(raw)
+    sellamount = metric("sellamount")(raw)
+    amount = metric("amount")(raw)
     engine = Engine(data_root=tmp_path / "data")
 
     buy = engine.evaluate(Model("buyamount", "ex2kamt", buyamount), buyamount, "20170103").collect()
@@ -395,7 +423,7 @@ def test_filtered_raw_column_keeps_field_source_context(sample_root: Path) -> No
 
 def test_vwap_component_and_field_aggregation(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
+    vwap = (metric("amount")(raw) / metric("volume")(raw)).alias("vwap")
     by_components = Aggregate("5m", "sum", apply_to="components")(vwap)
     by_field = Aggregate("5m", "mean", apply_to="field")(vwap)
     engine = Engine(data_root=sample_root)
@@ -415,8 +443,8 @@ def test_auction_merge_maps_before_aggregation(sample_root: Path) -> None:
     raw = Source("trades_tbar")
     merged_1m = Aggregate("1m", "sum", value_col="volume", auction="merge")(Col("volume")(raw))
     merged_5m = Aggregate("5m", "sum", value_col="volume", auction="merge")(Col("volume")(raw))
-    merged_open = Aggregate("5m", "first", value_col="open", auction="merge")(Metric("open", raw))
-    merged_close = Aggregate("5m", "last", value_col="close", auction="merge")(Metric("close", raw))
+    merged_open = Aggregate("5m", "first", value_col="open", auction="merge")(metric("open")(raw))
+    merged_close = Aggregate("5m", "last", value_col="close", auction="merge")(metric("close")(raw))
     engine = Engine(data_root=sample_root)
 
     frame_1m = engine.evaluate(Model("auction_merge_1m", "ex2kamt", merged_1m), merged_1m, "20170103").collect()
@@ -444,7 +472,7 @@ def test_auction_merge_targets_follow_output_frequency() -> None:
 # Grid-like null bars should not contribute to daily mean denominators.
 def test_daily_aggregate_applies_auction_policy(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    volume = Metric("volume", raw)
+    volume = metric("volume")(raw)
     keep = Aggregate("1d", "mean", value_col="volume", alias="value", auction="keep")(volume)
     drop = Aggregate("1d", "mean", value_col="volume", alias="value", auction="drop")(volume)
     merge = Aggregate("1d", "mean", value_col="volume", alias="value", auction="merge")(volume)
@@ -461,7 +489,7 @@ def test_daily_aggregate_applies_auction_policy(sample_root: Path) -> None:
 
 def test_scalar_arithmetic_on_metric(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    scaled = (Metric("volume", raw) * 100).alias("volume_x100")
+    scaled = (metric("volume")(raw) * 100).alias("volume_x100")
     frame = Engine(data_root=sample_root).evaluate(
         Model("scaled_volume", "ex2kamt", scaled),
         scaled,
@@ -473,7 +501,7 @@ def test_scalar_arithmetic_on_metric(sample_root: Path) -> None:
 
 def test_scalar_arithmetic_component_aggregation_keeps_payload(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    scaled = (Metric("volume", raw) * 100).alias("volume_x100")
+    scaled = (metric("volume")(raw) * 100).alias("volume_x100")
     aggregated = Aggregate("5m", "sum", apply_to="components")(scaled)
 
     frame = Engine(data_root=sample_root).evaluate(
@@ -488,8 +516,8 @@ def test_scalar_arithmetic_component_aggregation_keeps_payload(sample_root: Path
 
 def test_rolling_operator_uses_generic_op(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    amount = Metric("amount", raw)
-    volume = Metric("volume", raw)
+    amount = metric("amount")(raw)
+    volume = metric("volume")(raw)
     corr = Op("rolling_corr", amount, volume, window=2, alias="corr_2")
 
     frame = Engine(data_root=sample_root).evaluate(Model("corr", "ex2kamt", corr), corr, "20170103").collect()
@@ -502,8 +530,8 @@ def test_rolling_operator_uses_generic_op(sample_root: Path) -> None:
 
 def test_rolling_operator_requires_window() -> None:
     raw = Source("trades_tbar")
-    amount = Metric("amount", raw)
-    volume = Metric("volume", raw)
+    amount = metric("amount")(raw)
+    volume = metric("volume")(raw)
 
     with pytest.raises(ValueError, match="requires a positive integer window"):
         Op("rolling_corr", amount, volume)
@@ -514,8 +542,8 @@ def test_rolling_operator_requires_window() -> None:
 def test_rolling_cross_day_option_controls_minute_grouping(tmp_path: Path) -> None:
     _write_two_day_rolling_fixture(tmp_path)
     raw = Source("trades_tbar", lookback_days=2)
-    amount = Metric("amount", raw)
-    volume = Metric("volume", raw)
+    amount = metric("amount")(raw)
+    volume = metric("volume")(raw)
     reset = Op("rolling_corr", amount, volume, window=2, alias="corr")
     cross_day = Op("rolling_corr", amount, volume, window=2, alias="corr", cross_day=True)
     engine = Engine(data_root=tmp_path / "data")
@@ -531,7 +559,7 @@ def test_rolling_cross_day_option_controls_minute_grouping(tmp_path: Path) -> No
 
 def test_nested_operator_preserves_parent_payload(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
+    vwap = (metric("amount")(raw) / metric("volume")(raw)).alias("vwap")
     shifted = (vwap + 1).alias("vwap_plus_one")
 
     frame = Engine(data_root=sample_root).evaluate(
@@ -545,7 +573,7 @@ def test_nested_operator_preserves_parent_payload(sample_root: Path) -> None:
 
 def test_project_drops_operator_payload(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
+    vwap = (metric("amount")(raw) / metric("volume")(raw)).alias("vwap")
     projected = Project()(vwap)
 
     frame = Engine(data_root=sample_root).evaluate(Model("projected", "ex2kamt", projected), projected, "20170103").collect()
@@ -556,8 +584,8 @@ def test_project_drops_operator_payload(sample_root: Path) -> None:
 
 def test_join_preserves_payload_with_prefix(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
-    joined = Join()({"vwap": vwap, "close": Metric("close", raw)})
+    vwap = (metric("amount")(raw) / metric("volume")(raw)).alias("vwap")
+    joined = Join()({"vwap": vwap, "close": metric("close")(raw)})
 
     frame = Engine(data_root=sample_root).evaluate(Model("joined", "ex2kamt", joined), joined, "20170103").collect()
 
@@ -567,9 +595,9 @@ def test_join_preserves_payload_with_prefix(sample_root: Path) -> None:
 
 def test_fillnull_state_for_vwap_and_preclose(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
+    vwap = (metric("amount")(raw) / metric("volume")(raw)).alias("vwap")
     filled_vwap = FillNull("state")(vwap)
-    preclose = FillNull("state")(Metric("preclose", raw))
+    preclose = FillNull("state")(metric("preclose")(raw))
     engine = Engine(data_root=sample_root)
 
     vwap_frame = engine.evaluate(Model("filled_vwap", "ex2kamt", filled_vwap), filled_vwap, "20170103").collect()
@@ -582,7 +610,7 @@ def test_fillnull_state_for_vwap_and_preclose(sample_root: Path) -> None:
 
 def test_fillnull_drops_payload_and_blocks_component_aggregation(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
+    vwap = (metric("amount")(raw) / metric("volume")(raw)).alias("vwap")
     filled = FillNull("state")(vwap)
     aggregated = Aggregate("5m", "sum", apply_to="components")(filled)
 
@@ -613,8 +641,8 @@ def test_fillnull_state_uses_grain_path_after_operator(sample_root: Path) -> Non
 
 def test_fillnull_state_rejects_multi_source_field_info(tmp_path: Path) -> None:
     _write_multi_source_fixture(tmp_path)
-    trade_volume = Metric("volume", Source("trades_tbar"))
-    quote_volume = Metric("volume", Source("quotes_tbar"))
+    trade_volume = metric("volume")(Source("trades_tbar"))
+    quote_volume = metric("volume")(Source("quotes_tbar"))
     filled = FillNull("state")((trade_volume - quote_volume).alias("net_volume"))
 
     with pytest.raises(ValueError, match="requires FieldInfo.source"):
@@ -627,7 +655,7 @@ def test_fillnull_state_rejects_multi_source_field_info(tmp_path: Path) -> None:
 
 def test_grid_aligns_minute_frame_to_universe_calendar(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    gridded = Grid()(Metric("volume", raw))
+    gridded = Grid()(metric("volume")(raw))
 
     frame = Engine(data_root=sample_root).evaluate(Model("grid_volume", "ex2kamt", gridded), gridded, "20170103").collect()
 
@@ -639,7 +667,7 @@ def test_grid_aligns_minute_frame_to_universe_calendar(sample_root: Path) -> Non
 
 def test_grid_uses_explicit_resampled_frequency(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    volume_5m = Aggregate("5m", "sum", value_col="volume")(Metric("volume", raw))
+    volume_5m = Aggregate("5m", "sum", value_col="volume")(metric("volume")(raw))
     gridded = Grid("5m")(volume_5m)
 
     frame = Engine(data_root=sample_root).evaluate(Model("grid_volume_5m", "ex2kamt", gridded), gridded, "20170103").collect()
@@ -653,7 +681,7 @@ def test_grid_uses_explicit_resampled_frequency(sample_root: Path) -> None:
 
 def test_grid_infers_frequency_and_removed_auction_from_grain_path(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    volume_5m = Aggregate("5m", "sum", value_col="volume", auction="drop")(Metric("volume", raw))
+    volume_5m = Aggregate("5m", "sum", value_col="volume", auction="drop")(metric("volume")(raw))
     volume_15m = Aggregate("15m", "sum", value_col="volume", auction="keep")(volume_5m)
     gridded = Grid()((volume_15m + 0).alias("volume_shifted"))
 
@@ -681,7 +709,7 @@ def test_grid_aligns_raw_source_before_metric(sample_root: Path) -> None:
     assert raw_frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 934))["price"].to_list() == [None]
     assert raw_frame.filter((pl.col("secu_code") == 2) & (pl.col("minute") == 930))["price"].to_list() == [None]
 
-    volume = Metric("volume", gridded)
+    volume = metric("volume")(gridded)
     volume_frame = engine.evaluate(Model("grid_raw_volume", "ex2kamt", volume), volume, "20170103").collect()
 
     assert volume_frame.filter((pl.col("secu_code") == 1) & (pl.col("minute") == 930))["volume"].to_list() == [15.0]
@@ -720,7 +748,7 @@ def test_grid_rejects_value_column_that_conflicts_with_output_identity(sample_ro
 
 def test_fillnull_ffill_and_numeric_modes(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    close = Grid()(Metric("close", raw))
+    close = Grid()(metric("close")(raw))
     ffilled = FillNull("ffill")(close)
     zero_filled = FillNull(0)(close)
     engine = Engine(data_root=sample_root)
@@ -736,7 +764,7 @@ def test_fillnull_ffill_and_numeric_modes(sample_root: Path) -> None:
 
 def test_aggregate_apply_to_field_drops_payload(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
+    vwap = (metric("amount")(raw) / metric("volume")(raw)).alias("vwap")
     daily = Aggregate("1d", "mean", value_col="vwap", alias="value")(vwap)
     projected = Project()(daily)
     engine = Engine(data_root=sample_root)
@@ -750,7 +778,7 @@ def test_aggregate_apply_to_field_drops_payload(sample_root: Path) -> None:
 
 def test_preclose_without_state_raises(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    preclose = Metric("preclose", raw)
+    preclose = metric("preclose")(raw)
 
     with pytest.raises(ValueError, match="preclose metric is reserved"):
         Engine(data_root=sample_root).evaluate(Model("bad_preclose", "ex2kamt", preclose), preclose, "20170103").collect()
@@ -759,7 +787,7 @@ def test_preclose_without_state_raises(sample_root: Path) -> None:
 def test_preclose_source_context_comes_from_parent_field_info(sample_root: Path) -> None:
     raw = Source("trades_tbar", lookback_days=2)
     derived = Col("price").alias("px")(raw)
-    preclose = Metric("preclose", derived, alias="prev_close")
+    preclose = metric("preclose", alias="prev_close")(derived)
     engine = Engine(data_root=sample_root)
     engine._ensure_calendar()
 
@@ -772,7 +800,7 @@ def test_preclose_source_context_comes_from_parent_field_info(sample_root: Path)
 
 def test_preclose_alias_uses_operator_metadata(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    preclose = FillNull("state")(Metric("preclose", raw, alias="prev_close"))
+    preclose = FillNull("state")(metric("preclose", alias="prev_close")(raw))
 
     frame = Engine(data_root=sample_root).evaluate(
         Model("aliased_preclose", "ex2kamt", preclose),
@@ -786,7 +814,7 @@ def test_preclose_alias_uses_operator_metadata(sample_root: Path) -> None:
 
 def test_close_alias_preclose_is_not_reserved_preclose(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    close_named_preclose = FillNull("state")(Metric("close", raw, alias="preclose"))
+    close_named_preclose = FillNull("state")(metric("close", alias="preclose")(raw))
 
     frame = Engine(data_root=sample_root).evaluate(
         Model("close_named_preclose", "ex2kamt", close_named_preclose),
@@ -800,7 +828,7 @@ def test_close_alias_preclose_is_not_reserved_preclose(sample_root: Path) -> Non
 
 def test_collect_daily_output(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    output = Aggregate("1d", "last", value_col="close", alias="value")(Metric("close", raw))
+    output = Aggregate("1d", "last", value_col="close", alias="value")(metric("close")(raw))
     result = Engine(data_root=sample_root).collect(Model("close_last", "ex2kamt", output), dates=["20170103"])
 
     assert result.to_dict(as_series=False) == {
@@ -814,7 +842,7 @@ def test_collect_daily_output(sample_root: Path) -> None:
 def test_collect_emits_run_logging(sample_root: Path, caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="draco_model.runtime.engine")
     raw = Source("trades_tbar")
-    output = Aggregate("1d", "last", value_col="close", alias="value")(Metric("close", raw))
+    output = Aggregate("1d", "last", value_col="close", alias="value")(metric("close")(raw))
 
     Engine(data_root=sample_root).collect(Model("close_last", "ex2kamt", output), dates=["20170103"])
 
@@ -826,7 +854,7 @@ def test_collect_emits_run_logging(sample_root: Path, caplog: pytest.LogCaptureF
 def test_collect_concatenates_multiple_dates(tmp_path: Path) -> None:
     _write_two_day_collect_fixture(tmp_path)
     raw = Source("trades_tbar")
-    output = Aggregate("1d", "last", value_col="close", alias="value")(Metric("close", raw))
+    output = Aggregate("1d", "last", value_col="close", alias="value")(metric("close")(raw))
 
     result = Engine(data_root=tmp_path / "data").collect(
         Model("close_last", "ex2kamt", output),
@@ -843,7 +871,7 @@ def test_collect_concatenates_multiple_dates(tmp_path: Path) -> None:
 
 def test_collect_rejects_minute_output_even_with_value_column(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    output = Metric("volume", raw, alias="value")
+    output = metric("volume", alias="value")(raw)
 
     with pytest.raises(ValueError, match="requires a daily output"):
         Engine(data_root=sample_root).collect(Model("minute_value", "ex2kamt", output), dates=["20170103"])
@@ -851,7 +879,7 @@ def test_collect_rejects_minute_output_even_with_value_column(sample_root: Path)
 
 def test_trace_and_mermaid_show_expanded_operator_dag(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    model = Model("trace_vwap", "ex2kamt", (Metric("amount", raw) / Metric("volume", raw)).alias("vwap"))
+    model = Model("trace_vwap", "ex2kamt", (metric("amount")(raw) / metric("volume")(raw)).alias("vwap"))
 
     steps = Engine(data_root=sample_root).trace(model, "20170103")
     mermaid = model.explain_mermaid()
@@ -872,9 +900,9 @@ def test_trace_and_mermaid_show_expanded_operator_dag(sample_root: Path) -> None
 
 def test_frame_infos_match_materialized_columns(sample_root: Path) -> None:
     raw = Source("trades_tbar")
-    vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
+    vwap = (metric("amount")(raw) / metric("volume")(raw)).alias("vwap")
     filled = FillNull("state")(vwap)
-    corr = Op("rolling_corr", Metric("amount", raw), Metric("volume", raw), window=2, alias="corr")
+    corr = Op("rolling_corr", metric("amount")(raw), metric("volume")(raw), window=2, alias="corr")
     daily = Aggregate("1d", "mean", value_col="vwap", alias="daily_vwap")(vwap)
     minute_features = Join(how="left")({"filled": filled, "corr": corr})
     output = Project()(Join(how="left", on=DAILY_KEY_COLUMNS)({"minute_features": minute_features, "daily": daily}))
@@ -892,7 +920,7 @@ def test_frame_infos_match_materialized_columns(sample_root: Path) -> None:
 
 def test_info_inference_memoizes_shared_nodes(sample_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     raw = Source("trades_tbar")
-    vwap = (Metric("amount", raw) / Metric("volume", raw)).alias("vwap")
+    vwap = (metric("amount")(raw) / metric("volume")(raw)).alias("vwap")
     model = Model("memoized_schema", "ex2kamt", vwap)
     engine = Engine(data_root=sample_root)
     engine._ensure_calendar()
@@ -941,8 +969,8 @@ for op in {BUILTIN_FRAME_OPS!r}:
 
 def test_join_evaluates_distinct_sources(tmp_path: Path) -> None:
     _write_multi_source_fixture(tmp_path)
-    trade_volume = Metric("volume", Source("trades_tbar"))
-    quote_volume = Metric("volume", Source("quotes_tbar"))
+    trade_volume = metric("volume")(Source("trades_tbar"))
+    quote_volume = metric("volume")(Source("quotes_tbar"))
     joined = Join()({"trade_volume": trade_volume, "quote_volume": quote_volume})
 
     frame = Engine(data_root=tmp_path / "data").evaluate(
@@ -1101,8 +1129,8 @@ def test_merged_source_context_uses_max_lookback() -> None:
 
 
 def test_mixed_lookback_operands_inherit_max_lookback(sample_root: Path) -> None:
-    slow = Metric("volume", Source("trades_tbar", lookback_days=2))
-    fast = Metric("no", Source("trades_tbar"))
+    slow = metric("volume")(Source("trades_tbar", lookback_days=2))
+    fast = metric("no")(Source("trades_tbar"))
     combined = (slow + fast).alias("combined")
     engine = Engine(data_root=sample_root)
     engine._ensure_calendar()
@@ -1114,7 +1142,7 @@ def test_mixed_lookback_operands_inherit_max_lookback(sample_root: Path) -> None
 
 def test_window_op_rejects_non_frame_operands() -> None:
     raw = Source("trades_tbar")
-    amount = Metric("amount", raw)
+    amount = metric("amount")(raw)
 
     with pytest.raises(ValueError, match="exactly two frame"):
         Op("rolling_corr", Col("price"), Col("volume"), window=2)
@@ -1142,7 +1170,7 @@ def test_rolling_corr_guards_float_negative_variance() -> None:
 
 
 def test_aggregate_minute_frequency_requires_minute_input(sample_root: Path) -> None:
-    daily = Aggregate("1d", "sum", value_col="volume", alias="volume")(Metric("volume", Source("trades_tbar")))
+    daily = Aggregate("1d", "sum", value_col="volume", alias="volume")(metric("volume")(Source("trades_tbar")))
     five_minute = Aggregate("5m", "sum", value_col="volume", alias="volume")(daily)
     engine = Engine(data_root=sample_root)
     engine._ensure_calendar()
@@ -1152,7 +1180,7 @@ def test_aggregate_minute_frequency_requires_minute_input(sample_root: Path) -> 
 
 
 def test_fillnull_state_requires_minute_input(sample_root: Path) -> None:
-    daily = Aggregate("1d", "last", value_col="close", alias="close")(Metric("close", Source("trades_tbar")))
+    daily = Aggregate("1d", "last", value_col="close", alias="close")(metric("close")(Source("trades_tbar")))
     filled = FillNull("state")(daily)
     engine = Engine(data_root=sample_root)
     engine._ensure_calendar()

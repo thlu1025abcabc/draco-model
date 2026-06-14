@@ -44,8 +44,8 @@ Create a generic operator.
 ## Examples
 
 ```python
-amount = Metric("amount", raw)
-volume = Metric("volume", raw)
+amount = metric("amount")(raw)
+volume = metric("volume")(raw)
 
 vwap = (amount / volume).alias("vwap")
 corr = Op("rolling_corr", amount, volume, window=5, alias="corr_5")

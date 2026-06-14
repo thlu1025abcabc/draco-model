@@ -199,6 +199,37 @@ def _fill_null_info_from_parent(parent: FrameInfo) -> FrameInfo:
     )
 
 
+# `metric("preclose")` builds a reserved marker node: its info builder tags the field with
+# operator="preclose" so FillNull('state') (above) can rebuild it from close_state, and its
+# executor refuses direct evaluation.
+@register_executor("metric_reserved")
+def _metric_reserved(node: Node, context: EvalContext) -> pl.LazyFrame:
+    raise ValueError(
+        "preclose metric is reserved; use FillNull('state')(metric('preclose')(Source(...))) "
+        "to derive it from close_state."
+    )
+
+
+@register_info("metric_reserved")
+def _metric_reserved_info(node: Node, parent_infos: dict[str, FrameInfo], context: EvalContext) -> FrameInfo:
+    alias = str(node.params["alias"])
+    source, lookback, _ = parent_infos["input"].merged_source_context()
+    return FrameInfo.from_columns(
+        (*KEY_COLUMNS, alias),
+        identity_keys=KEY_COLUMNS,
+        fields={
+            alias: FieldInfo(
+                name=alias,
+                column=alias,
+                operator="preclose",
+                source=source,
+                lookback_days=lookback,
+                grain_path=(("1m", "keep"),),
+            )
+        },
+    )
+
+
 def _close_state_from_node(
     node: Node,
     info: FieldInfo,
