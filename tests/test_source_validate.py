@@ -288,12 +288,13 @@ def test_trading_calendar_requires_known_date_column(tmp_path: Path) -> None:
         TradingCalendar.from_data_root(tmp_path / "data")
 
 
-def test_unknown_source_without_key_columns_rejects_identity(tmp_path: Path) -> None:
+def test_unknown_source_rejects_identity_even_with_standard_key_columns(tmp_path: Path) -> None:
     path = tmp_path / "bar" / "20170103.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
-    pl.DataFrame({"foo": [1.0]}).write_parquet(path)
+    pl.DataFrame({"SecuCode": [1], "MinBar": [930], "value": [1.0]}).write_parquet(path)
 
     catalog = SourceCatalog(tmp_path)
 
-    with pytest.raises(ValueError, match="has no identity keys"):
+    assert catalog.schema("bar", ["20170103"]) == ("secu_code", "minute", "value", "date")
+    with pytest.raises(ValueError, match="has no registered identity keys"):
         catalog.identity_keys("bar", ["20170103"])

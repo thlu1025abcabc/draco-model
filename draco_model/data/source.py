@@ -47,13 +47,9 @@ class SourceCatalog:
         if fixed is not None:
             return fixed
         columns = self.schema(source, dates)
-        if all(column in columns for column in KEY_COLUMNS):
-            return KEY_COLUMNS
-        if all(column in columns for column in DAILY_KEY_COLUMNS):
-            return DAILY_KEY_COLUMNS
         raise ValueError(
-            f"Source {source!r} has no identity keys: register fixed keys or include the standard "
-            f"key columns {KEY_COLUMNS} or {DAILY_KEY_COLUMNS}. Normalized columns: {list(columns)}."
+            f"Source {source!r} has no registered identity keys. "
+            f"Register the source before using it in a DAG. Normalized columns: {list(columns)}."
         )
 
     def _scan_date(self, source: str, date: str) -> pl.LazyFrame:
