@@ -22,6 +22,33 @@ for step in engine.trace(model, "20170103"):
 
 `trace()` materializes each frame node and returns `TraceStep` objects.
 
+## Profile Shared Plans
+
+```python
+from draco_model import profile_plan
+
+profile = profile_plan([amount_model, vwap_model])
+
+for node in profile.cache_candidates():
+    print(node.op, node.params, node.ref_count, node.models)
+```
+
+`profile_plan()` is a static analysis pass. It does not scan parquet files or execute Polars plans. Use it to identify structural nodes shared by multiple models and to write stable tests for future batch-planner cache behavior.
+
+## Profile Runtime Events
+
+```python
+engine = Engine(data_root="data")
+
+with engine.profiler() as profiler:
+    engine.collect(model, ["20170103"])
+
+print(profiler.summary())
+print(profiler.to_frame())
+```
+
+The runtime profiler records events around the normal `collect()` path, including `infer_info`, `eval`, cache hit/miss, and final materialization spans. It does not materialize intermediate nodes.
+
 ## Render Mermaid
 
 ```python

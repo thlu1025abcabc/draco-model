@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from pathlib import Path
 from time import perf_counter
-from typing import Callable
+from typing import Callable, Iterator
 
 import polars as pl
 
@@ -21,6 +22,7 @@ from draco_model.runtime.execution import (
     get_executor,
     get_info_builder,
 )
+from draco_model.runtime.profiling import PlanProfile, Profiler, profile_plan
 
 
 logger = logging.getLogger(__name__)
@@ -45,9 +47,19 @@ class Engine:
         self._memory: dict[tuple[str, str, str], pl.LazyFrame] = {}
         self._info_memo: dict[tuple[str, str, str], FrameInfo] = {}
         self._grid_memory: dict[tuple[str, str, tuple[int, ...]], pl.DataFrame] = {}
+        self._profiler: Profiler | None = None
 
     def collect(self, model: Model, dates: list[str] | tuple[str, ...]) -> pl.DataFrame:
         """Evaluate a model output for dates and collect daily factor rows."""
+        with self._profile_span(
+            "collect",
+            model=model.name,
+            universe=model.universe,
+            dates=tuple(_normalize_date(date) for date in dates),
+        ):
+            return self._collect(model, dates)
+
+    def _collect(self, model: Model, dates: list[str] | tuple[str, ...]) -> pl.DataFrame:
         if not dates:
             raise ValueError("Engine.collect requires at least one date.")
         t0 = perf_counter()
@@ -68,7 +80,13 @@ class Engine:
             frame = self.evaluate(model, model.output, date)
             outputs.append(format_factor_output(frame, model.name, date))
             logger.debug("collect.date.done model=%s date=%s", model.name, date)
-        result = pl.concat(outputs, how="vertical").collect()
+        with self._profile_span(
+            "collect.materialize",
+            model=model.name,
+            universe=model.universe,
+            dates=tuple(normalized_dates),
+        ):
+            result = pl.concat(outputs, how="vertical").collect()
         logger.info(
             "collect.done model=%s universe=%s dates=%s rows=%d elapsed=%.3fs",
             model.name,
@@ -91,7 +109,15 @@ class Engine:
             node.id,
             node.op,
         )
-        return self._eval(model, node, normalized)
+        with self._profile_span(
+            "evaluate",
+            model=model.name,
+            universe=model.universe,
+            date=normalized,
+            node_id=node.id,
+            op=node.op,
+        ):
+            return self._eval(model, node, normalized)
 
     def trace(self, model: Model, date: str) -> list[TraceStep]:
         """Evaluate frame nodes one by one and return their materialized outputs."""
@@ -131,6 +157,21 @@ class Engine:
         logger.info("trace.done model=%s universe=%s date=%s steps=%d", model.name, model.universe, eval_date, len(steps))
         return steps
 
+    def profile_plan(self, models: list[Model] | tuple[Model, ...]) -> PlanProfile:
+        """Return a static shared-node profile for a group of models."""
+        return profile_plan(models)
+
+    @contextmanager
+    def profiler(self) -> Iterator[Profiler]:
+        """Collect runtime profile events for Engine calls inside the context."""
+        profiler = Profiler()
+        previous = self._profiler
+        self._profiler = profiler
+        try:
+            yield profiler
+        finally:
+            self._profiler = previous
+
     def _ensure_calendar(self) -> None:
         if self.trading_calendar is None:
             logger.debug("calendar.load data_root=%s", self.data_root)
@@ -154,10 +195,34 @@ class Engine:
         key = (model.universe, node.id, eval_date)
         if key in self._memory:
             logger.debug("eval.cache_hit universe=%s date=%s node_id=%s op=%s", model.universe, eval_date, node.id, node.op)
+            self._profile_record(
+                "eval.cache_hit",
+                model=model.name,
+                universe=model.universe,
+                date=eval_date,
+                node_id=node.id,
+                op=node.op,
+            )
             return self._memory[key]
 
         logger.debug("eval.cache_miss universe=%s date=%s node_id=%s op=%s", model.universe, eval_date, node.id, node.op)
-        out = get_executor(node.op)(node, self._context(model, eval_date))
+        self._profile_record(
+            "eval.cache_miss",
+            model=model.name,
+            universe=model.universe,
+            date=eval_date,
+            node_id=node.id,
+            op=node.op,
+        )
+        with self._profile_span(
+            "eval",
+            model=model.name,
+            universe=model.universe,
+            date=eval_date,
+            node_id=node.id,
+            op=node.op,
+        ):
+            out = get_executor(node.op)(node, self._context(model, eval_date))
 
         self._memory[key] = out
         return out
@@ -166,9 +231,25 @@ class Engine:
         key = (model.universe, node.id, eval_date)
         if key in self._info_memo:
             logger.debug("info.cache_hit universe=%s date=%s node_id=%s op=%s", model.universe, eval_date, node.id, node.op)
+            self._profile_record(
+                "infer_info.cache_hit",
+                model=model.name,
+                universe=model.universe,
+                date=eval_date,
+                node_id=node.id,
+                op=node.op,
+            )
             return self._info_memo[key]
 
         logger.debug("info.cache_miss universe=%s date=%s node_id=%s op=%s", model.universe, eval_date, node.id, node.op)
+        self._profile_record(
+            "infer_info.cache_miss",
+            model=model.name,
+            universe=model.universe,
+            date=eval_date,
+            node_id=node.id,
+            op=node.op,
+        )
         parent_infos = {
             input_name: self._infer_info(model, parent, eval_date)
             for input_name, parent in node.inputs.items()
@@ -180,9 +261,29 @@ class Engine:
             raise ValueError(
                 f"Node op {node.op!r} has no registered frame-info builder; register one with register_info."
             )
-        info = builder(node, parent_infos, context)
+        with self._profile_span(
+            "infer_info",
+            model=model.name,
+            universe=model.universe,
+            date=eval_date,
+            node_id=node.id,
+            op=node.op,
+        ):
+            info = builder(node, parent_infos, context)
         self._info_memo[key] = info
         return info
+
+    def _profile_record(self, event: str, **fields: object) -> None:
+        if self._profiler is not None:
+            self._profiler.record(event, **fields)
+
+    @contextmanager
+    def _profile_span(self, event: str, **fields: object) -> Iterator[None]:
+        if self._profiler is None:
+            yield
+            return
+        with self._profiler.span(event, **fields):
+            yield
 
 
 def _normalize_date(value: object) -> str:

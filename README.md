@@ -28,6 +28,7 @@ df = Engine(data_root="data").collect(model, dates=["20170103"])
 - `Join(how="full")` 用 SQL full join 横向对齐多个 frame；`Join(how="left", on=...)` 按显式 key 做 left join；显式 `on` 必须覆盖两个输入共享的 identity keys，避免漏掉 `price/side` 这类 key 后产生笛卡尔扇出。`how="full"` 不允许混合 daily identity frame 与 minute/raw frame；混合粒度请显式使用 `Join(how="left", on=("date", "secu_code"))`。两者输出 identity 都是所有输入 identity keys 的有序并集。
 - `Project()` 显式丢弃 internal payload，只保留 key columns + public fields。
 - `FillNull(value)` 支持固定数值、`"ffill"` 和 `"state"`；`"state"` 使用 field 的 `FieldInfo.source` 和 `grain_path` 构造同粒度 close_state，并对齐待填 frame 的 key 后填 public field。`FillNull()` 后会丢弃 old payload。
+- `profile_plan(models)` 静态分析一组 model 的共享 structural nodes，并标记适合 batch materialization 的 cache candidate。
 
 使用建议：`Source(...)` 不会自动补 grid，但如果 raw/minute source 后续要和 daily feature 或其他粒度横向组合，优先显式套一层 `Grid()`。这样下游节点都落在统一的 `(date, secu_code, minute)` grid 上，能减少 mixed-grain `Join()` 的歧义。
 
@@ -44,6 +45,26 @@ Payload 的当前特性：
 Public alias 和 `Join()` input name 不能以 `__` 开头，也不能使用 `date`、`secu_code`、`minute` 这些 key column 名。
 
 旧 public API 已删除：`Field`、`RatioField`、`Auction`、`Resample`、`DailyAgg`、`Concat` 不再导出。
+
+## Profiling
+
+Profiling 分为不跑数据的静态 DAG 分析和可选的运行时事件记录。它们都不改变 `collect()` 的执行语义。
+
+```python
+from draco_model import Engine, Model, profile_plan
+
+plan = profile_plan([amount_model, vwap_model])
+print(plan.cache_candidates())
+
+engine = Engine(data_root="data")
+with engine.profiler() as profiler:
+    engine.collect(amount_model, dates=["20170103"])
+
+print(profiler.summary())
+events = profiler.to_frame()
+```
+
+`profile_plan()` 用 structural node id 统计一组 model 中重复出现的子图，适合给后续 batch planner / cache 策略写稳定测试。`Engine.profiler()` 只记录 `collect`、`evaluate`、`infer_info`、`eval` 和最终 materialize 的事件、耗时与 cache hit/miss，不会像 `trace()` 那样 materialize 每个中间节点。
 
 ## 文档
 

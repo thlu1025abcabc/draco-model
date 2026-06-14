@@ -7,6 +7,7 @@ This section documents public APIs exported from `draco_model`, `draco_model.lay
 - [Engine](engine.md)
 - [Model, Node, and Graph Metadata](model.md)
 - [Recipes and Shortcuts](recipes.md)
+- `profile_plan(...)` for static shared-node profiling across model groups.
 
 ## Layers
 

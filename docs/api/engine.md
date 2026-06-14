@@ -53,6 +53,23 @@ Engine.trace(model: Model, date: str) -> list[TraceStep]
 
 Materialize each frame node in dependency order. Use this for debugging or validation.
 
+### `profile_plan`
+
+```python
+Engine.profile_plan(models: list[Model] | tuple[Model, ...]) -> PlanProfile
+```
+
+Return a static shared-node profile for a group of models. This is equivalent to calling `profile_plan(models)`.
+
+### `profiler`
+
+```python
+with engine.profiler() as profiler:
+    engine.collect(model, ["20170103"])
+```
+
+Collect runtime profiling events for Engine calls inside the context. The profiler records event counts, elapsed times, node ids, ops, and cache hit/miss events without changing execution semantics.
+
 ## Examples
 
 ```python
@@ -61,6 +78,10 @@ engine = Engine(data_root="data")
 daily = engine.collect(model, dates=["20170103", "20170104"])
 minute = engine.evaluate(model, close_node, "20170103").collect()
 steps = engine.trace(model, "20170103")
+
+with engine.profiler() as profiler:
+    engine.collect(model, dates=["20170103"])
+events = profiler.to_frame()
 ```
 
 ## Raises
