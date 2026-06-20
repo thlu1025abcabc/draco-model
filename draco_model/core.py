@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 
 @dataclass(frozen=True)
@@ -95,19 +95,27 @@ class Layer:
 
 
 class Model:
-    """Named factor graph rooted at a frame node."""
+    """Named computation graph with one or more frame outputs."""
 
-    def __init__(self, name: str, universe: str, output: Node) -> None:
-        """Create a model for one universe and one frame output node."""
-        if output.kind != "frame":
-            raise ValueError("Model output must be a frame node.")
+    def __init__(
+        self,
+        name: str,
+        universe: str | None,
+        output: dict[str, Node],
+    ) -> None:
+        """Create a model with optional universe alignment and named frame outputs."""
+        if universe is not None and (not isinstance(universe, str) or not universe):
+            raise TypeError("Model universe must be a non-empty string or None.")
+        if not isinstance(output, dict):
+            raise TypeError("Model output must be a dictionary mapping output names to frame nodes.")
         self.name = name
         self.universe = universe
-        self.output = output
+        self.output = dict(output)
+        self.outputs = _normalize_model_outputs(self.output)
 
     def nodes(self) -> list[Node]:
         """Return graph nodes in dependency-first topological order."""
-        return _topological_nodes(self.output)
+        return _topological_nodes(node for _, node in self.outputs)
 
     def explain_mermaid(self) -> str:
         """Render the model DAG as a Mermaid flowchart."""
@@ -137,7 +145,27 @@ def _normalize_inputs(inputs: Node | Mapping[str, Node]) -> dict[str, Node]:
     return normalized
 
 
-def _topological_nodes(output: Node) -> list[Node]:
+def _normalize_model_outputs(
+    output: dict[str, Node],
+) -> tuple[tuple[str, Node], ...]:
+    if not output:
+        raise ValueError("Model output must contain at least one output.")
+    outputs: list[tuple[str, Node]] = []
+    for name, node in output.items():
+        if not isinstance(name, str) or not name:
+            raise TypeError("Model output name must be a non-empty string.")
+        if not isinstance(node, Node):
+            raise TypeError(f"Model output {name!r} node must be a Node.")
+        if node.kind != "frame":
+            raise ValueError(f"Model output {name!r} node must be a frame node.")
+        outputs.append((name, node))
+    return tuple(outputs)
+
+
+def _topological_nodes(output: Iterable[Node]) -> list[Node]:
+    roots = list(output)
+    if not roots:
+        raise ValueError("Model output must contain at least one root node.")
     order: list[str] = []
     chosen: dict[str, Node] = {}
     seen_objects: set[int] = set()
@@ -163,7 +191,10 @@ def _topological_nodes(output: Node) -> list[Node]:
         if prior is None:
             order.append(node.id)
 
-    visit(output)
+    for root in roots:
+        if not isinstance(root, Node):
+            raise TypeError("Model output roots must be Node objects.")
+        visit(root)
     return [chosen[node_id] for node_id in order]
 
 

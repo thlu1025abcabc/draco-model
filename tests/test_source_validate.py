@@ -16,6 +16,8 @@ from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
 def test_fixed_source_schema_does_not_scan_files(tmp_path: Path) -> None:
     catalog = SourceCatalog(tmp_path)
 
+    steptrades_schema = catalog.schema("steptrades", ["20170103"])
+    steporders_schema = catalog.schema("steporders", ["20170103"])
     trade_schema = catalog.schema("trades_tbar", ["20170103"])
     cancel_schema = catalog.schema("cancels_tbar", ["20170103"])
     quote_schema = catalog.schema("quotes_tbar", ["20170103"])
@@ -23,6 +25,24 @@ def test_fixed_source_schema_does_not_scan_files(tmp_path: Path) -> None:
     snapshot_schema = catalog.schema("snapshot_tbar", ["20170103"])
     universe_schema = catalog.schema("universe/ex2kamt", ["20170103"])
 
+    assert steptrades_schema == (
+        "date",
+        "secu_code",
+        "deal_time",
+        "buy_id",
+        "sell_id",
+        "deal_id",
+        "price",
+        "volume",
+        "side",
+    )
+    assert steporders_schema == (
+        "date",
+        "secu_code",
+        "order_time",
+        "order_id",
+        "order_type",
+    )
     assert trade_schema == (
         "secu_code",
         "minute",
@@ -91,7 +111,9 @@ def test_fixed_source_schema_does_not_scan_files(tmp_path: Path) -> None:
 
 def test_fixed_source_schemas_match_standardized_representative_columns() -> None:
     for source, fixed_schema in _FIXED_SOURCE_SCHEMAS.items():
-        actual = _standardize_columns(_representative_source_frame(source).lazy(), "20170103").collect_schema().names()
+        actual = _standardize_columns(
+            _representative_source_frame(source).lazy(), "20170103", source
+        ).collect_schema().names()
         missing = [column for column in fixed_schema if column not in actual]
         assert missing == [], f"{source} fixed schema missing from standardized columns: {missing}"
 
@@ -118,7 +140,7 @@ def test_fixed_source_missing_column_raises_clear_error(
     raw = Source("trades_tbar")
 
     with pytest.raises(ValueError, match="missing fixed schema columns.*vw_wait_time"):
-        Engine(data_root=tmp_path / "data").evaluate(Model("bad_source", "ex2kamt", raw), raw, "20170103").collect()
+        Engine(data_root=tmp_path / "data").evaluate(Model("bad_source", "ex2kamt", {"value": raw}), raw, "20170103").collect()
     assert "source.fixed_schema_missing source=trades_tbar date=20170103" in caplog.text
 
 
@@ -127,6 +149,8 @@ def test_fixed_source_infos_have_expected_keys_and_grain(tmp_path: Path) -> None
     engine = Engine(data_root=tmp_path / "data")
     engine._ensure_calendar()
     expected = {
+        "steptrades": (("date", "secu_code", "deal_id"), "unknown"),
+        "steporders": (("date", "secu_code", "order_time", "order_id", "order_type"), "unknown"),
         "trades_tbar": ((*KEY_COLUMNS, "price", "side"), "raw"),
         "cancels_tbar": ((*KEY_COLUMNS, "price", "side"), "raw"),
         "quotes_tbar": ((*KEY_COLUMNS, "price", "side"), "raw"),
@@ -137,7 +161,7 @@ def test_fixed_source_infos_have_expected_keys_and_grain(tmp_path: Path) -> None
 
     for source, (keys, grain) in expected.items():
         node = Source(source)
-        schema = engine._infer_info(Model(f"schema_{source.replace('/', '_')}", "ex2kamt", node), node, "20170103")
+        schema = engine._infer_info(Model(f"schema_{source.replace('/', '_')}", "ex2kamt", {"value": node}), node, "20170103")
         assert schema.keys == keys
         assert schema.grain == grain
 
@@ -205,6 +229,28 @@ def _write_trading_days(tmp_path: Path) -> None:
 
 
 def _representative_source_frame(source: str) -> pl.DataFrame:
+    if source == "steptrades":
+        return pl.DataFrame(
+            {
+                "SecuCode": [1],
+                "DealTime": [93000000],
+                "BuyID": [1],
+                "SellID": [2],
+                "DealID": [1],
+                "Price": [1000],
+                "Volume": [10],
+                "Side": [0],
+            }
+        )
+    if source == "steporders":
+        return pl.DataFrame(
+            {
+                "SecuCode": [1],
+                "OrderTime": [92950000],
+                "OrderID": [1],
+                "OrderType": [1],
+            }
+        )
     if source in {"trades_tbar", "cancels_tbar"}:
         return pl.DataFrame(
             {

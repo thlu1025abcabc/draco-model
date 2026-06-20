@@ -14,24 +14,23 @@ from draco_model.core import Model, Node, resolve_node_names
 from draco_model.data.source import SourceCatalog
 from draco_model.data.trading_calendar import TradingCalendar
 from draco_model.data.universe import UniverseCatalog
+from draco_model.market.schema import DAILY_KEY_COLUMNS
 from draco_model.market.minute_calendar import MinuteCalendar
 from draco_model.runtime.execution import (
     can_collect,
     EvalContext,
-    FactorOutputColumns,
     FrameInfo,
     TraceStep,
     format_factor_output,
     get_executor,
     get_info_builder,
-    normalize_factor_output_columns,
 )
 from draco_model.runtime.profiling import DEFAULT_EXCLUDE_CACHE_OPS, PlanProfile, Profiler, profile_plan
 
 
 logger = logging.getLogger(__name__)
 
-BatchCacheKey = tuple[str, str, str]
+BatchCacheKey = tuple[str | None, str, str]
 
 
 @dataclass
@@ -39,7 +38,6 @@ class _BatchScope:
     candidates: set[BatchCacheKey]
     frames: dict[BatchCacheKey, pl.DataFrame] = field(default_factory=dict)
     lazy_frames: dict[BatchCacheKey, pl.LazyFrame] = field(default_factory=dict)
-    in_progress: set[BatchCacheKey] = field(default_factory=set)
 
 
 class Engine:
@@ -58,8 +56,8 @@ class Engine:
         self.sources = SourceCatalog(self.data_root, self.minute_calendar)
         self.universes = UniverseCatalog(self.data_root)
         self.trading_calendar = trading_calendar
-        self._memory: dict[tuple[str, str, str], pl.LazyFrame] = {}
-        self._info_memo: dict[tuple[str, str, str], FrameInfo] = {}
+        self._memory: dict[tuple[str | None, str, str], pl.LazyFrame] = {}
+        self._info_memo: dict[tuple[str | None, str, str], FrameInfo] = {}
         self._grid_memory: dict[tuple[str, str, tuple[int, ...]], pl.DataFrame] = {}
         self._profiler: Profiler | None = None
 
@@ -67,26 +65,22 @@ class Engine:
         self,
         model: Model,
         dates: list[str] | tuple[str, ...],
-        *,
-        output_columns: FactorOutputColumns = None,
     ) -> pl.DataFrame:
         """Evaluate a model output for dates and collect daily factor rows."""
-        normalized_output_columns = normalize_factor_output_columns(output_columns)
+        _require_model_universe(model, "Engine.collect")
         with self._profile_span(
             "collect",
             model=model.name,
             universe=model.universe,
             dates=tuple(_normalize_date(date) for date in dates),
-            output_columns=normalized_output_columns,
         ):
-            return self._collect(model, dates, normalized_output_columns)
+            return self._collect(model, dates)
 
     def collect_many(
         self,
         models: list[Model] | tuple[Model, ...],
         dates: list[str] | tuple[str, ...],
         *,
-        output_columns: FactorOutputColumns = None,
         min_cache_ref_count: int = 2,
         exclude_cache_ops: Iterable[str] = DEFAULT_EXCLUDE_CACHE_OPS,
     ) -> pl.DataFrame:
@@ -97,21 +91,19 @@ class Engine:
         if not dates:
             raise ValueError("Engine.collect_many requires at least one date.")
         _validate_unique_model_names(model_list)
-        normalized_output_columns = normalize_factor_output_columns(output_columns)
+        _require_models_universe(model_list, "Engine.collect_many")
         normalized_dates = tuple(_normalize_date(date) for date in dates)
         excluded_ops = tuple(exclude_cache_ops)
         with self._profile_span(
             "collect_many",
             models=tuple(model.name for model in model_list),
             dates=normalized_dates,
-            output_columns=normalized_output_columns,
             min_cache_ref_count=min_cache_ref_count,
             exclude_cache_ops=excluded_ops,
         ):
             return self._collect_many(
                 model_list,
                 normalized_dates,
-                normalized_output_columns,
                 min_cache_ref_count,
                 excluded_ops,
             )
@@ -120,7 +112,6 @@ class Engine:
         self,
         model: Model,
         dates: list[str] | tuple[str, ...],
-        output_columns: tuple[str, ...],
     ) -> pl.DataFrame:
         if not dates:
             raise ValueError("Engine.collect requires at least one date.")
@@ -137,17 +128,26 @@ class Engine:
         for date in normalized_dates:
             logger.debug("collect.date.start model=%s date=%s", model.name, date)
             self._grid_memory.clear()
-            info = self._infer_info(model, model.output, date)
-            _validate_collect_info(info, output_columns)
-            frame = self.evaluate(model, model.output, date)
-            outputs.append(format_factor_output(frame, model.name, date, output_columns))
+            universe = self._output_universe(model.universe, date)
+            for output_name, output_node in model.outputs:
+                info = self._infer_info(model, output_node, date)
+                value_column = _validate_collect_info(info, model.name, output_name)
+                frame = self.evaluate(model, output_node, date)
+                outputs.append(
+                    format_factor_output(
+                        frame,
+                        _factor_name(model, output_name),
+                        date,
+                        value_column,
+                        universe,
+                    )
+                )
             logger.debug("collect.date.done model=%s date=%s", model.name, date)
         with self._profile_span(
             "collect.materialize",
             model=model.name,
             universe=model.universe,
             dates=tuple(normalized_dates),
-            output_columns=output_columns,
         ):
             result = pl.concat(outputs, how="vertical").collect()
         logger.info(
@@ -181,6 +181,27 @@ class Engine:
             op=node.op,
         ):
             return self._eval(model, node, normalized)
+
+    def evaluate_outputs(self, model: Model, eval_date: str) -> dict[str, pl.LazyFrame]:
+        """Evaluate all named model outputs for one date without formatting their grain."""
+        self._ensure_calendar()
+        normalized = _normalize_date(eval_date)
+        self._grid_memory.clear()
+        logger.debug(
+            "evaluate_outputs model=%s universe=%s date=%s outputs=%s",
+            model.name,
+            model.universe,
+            normalized,
+            [name for name, _ in model.outputs],
+        )
+        with self._profile_span(
+            "evaluate_outputs",
+            model=model.name,
+            universe=model.universe,
+            date=normalized,
+            outputs=tuple(name for name, _ in model.outputs),
+        ):
+            return {name: self._eval(model, node, normalized) for name, node in model.outputs}
 
     def trace(self, model: Model, date: str) -> list[TraceStep]:
         """Evaluate frame nodes one by one and return their materialized outputs."""
@@ -254,7 +275,6 @@ class Engine:
         self,
         models: list[Model],
         dates: tuple[str, ...],
-        output_columns: tuple[str, ...],
         min_cache_ref_count: int,
         exclude_cache_ops: tuple[str, ...],
     ) -> pl.DataFrame:
@@ -284,20 +304,33 @@ class Engine:
             len(scope.candidates),
         )
         outputs: list[pl.LazyFrame] = []
+        universe_cache: dict[tuple[str, str], pl.LazyFrame] = {}
         for date in dates:
             self._grid_memory.clear()
             for model in models:
                 logger.debug("collect_many.model.start model=%s date=%s", model.name, date)
-                info = self._infer_info(model, model.output, date)
-                _validate_collect_info(info, output_columns)
-                frame = self._eval_batch(model, model.output, date, scope)
-                outputs.append(format_factor_output(frame, model.name, date, output_columns))
+                universe_key = (model.universe, date)
+                if universe_key not in universe_cache:
+                    universe_cache[universe_key] = self._output_universe(model.universe, date)
+                universe = universe_cache[universe_key]
+                for output_name, output_node in model.outputs:
+                    info = self._infer_info(model, output_node, date)
+                    value_column = _validate_collect_info(info, model.name, output_name)
+                    frame = self._eval_batch(model, output_node, date, scope)
+                    outputs.append(
+                        format_factor_output(
+                            frame,
+                            _factor_name(model, output_name),
+                            date,
+                            value_column,
+                            universe,
+                        )
+                    )
                 logger.debug("collect_many.model.done model=%s date=%s", model.name, date)
         with self._profile_span(
             "collect_many.materialize",
             models=tuple(model.name for model in models),
             dates=dates,
-            output_columns=output_columns,
         ):
             result = pl.concat(outputs, how="vertical").collect()
         logger.info(
@@ -308,6 +341,13 @@ class Engine:
             perf_counter() - t0,
         )
         return result
+
+    def _output_universe(self, universe: str, date: str) -> pl.LazyFrame:
+        return (
+            self.universes.scan(universe, date)
+            .with_columns(pl.lit(date).alias("date"))
+            .select(list(DAILY_KEY_COLUMNS))
+        )
 
     def _context(self, model: Model, eval_date: str, *, evaluate: Callable[[Node], pl.LazyFrame] | None = None) -> EvalContext:
         assert self.trading_calendar is not None
@@ -385,7 +425,7 @@ class Engine:
             )
             return scope.lazy_frames[key]
 
-        if key in scope.candidates and key not in scope.in_progress:
+        if key in scope.candidates:
             self._profile_record(
                 "batch_cache.miss",
                 model=model.name,
@@ -394,30 +434,26 @@ class Engine:
                 node_id=node.id,
                 op=node.op,
             )
-            scope.in_progress.add(key)
-            try:
-                lazy = self._execute_node_batch(model, node, eval_date, scope)
-                start = perf_counter()
-                frame = lazy.collect()
-                self._profile_record(
-                    "batch_cache.materialize",
-                    elapsed_ms=(perf_counter() - start) * 1000,
-                    model=model.name,
-                    universe=model.universe,
-                    date=eval_date,
-                    node_id=node.id,
-                    op=node.op,
-                    rows=frame.height,
-                    columns=len(frame.columns),
-                )
-                scope.frames[key] = frame
-                return frame.lazy()
-            finally:
-                scope.in_progress.remove(key)
+            lazy = self._execute_node_batch(model, node, eval_date, scope)
+            start = perf_counter()
+            frame = lazy.collect()
+            self._profile_record(
+                "batch_cache.materialize",
+                elapsed_ms=(perf_counter() - start) * 1000,
+                model=model.name,
+                universe=model.universe,
+                date=eval_date,
+                node_id=node.id,
+                op=node.op,
+                rows=frame.height,
+                columns=len(frame.columns),
+            )
+            scope.frames[key] = frame
+            return frame.lazy()
 
+        # Reaching here means key is not a cache candidate; cache its lazy plan.
         lazy = self._execute_node_batch(model, node, eval_date, scope)
-        if key not in scope.candidates:
-            scope.lazy_frames[key] = lazy
+        scope.lazy_frames[key] = lazy
         return lazy
 
     def _execute_node_batch(self, model: Model, node: Node, eval_date: str, scope: _BatchScope) -> pl.LazyFrame:
@@ -509,6 +545,12 @@ def _normalize_date(value: object) -> str:
     return str(value).replace("-", "")
 
 
+def _factor_name(model: Model, output_name: str) -> str:
+    if len(model.outputs) == 1 and output_name == "value":
+        return model.name
+    return f"{model.name}__{output_name}"
+
+
 def _validate_unique_model_names(models: list[Model]) -> None:
     seen: set[str] = set()
     duplicates: list[str] = []
@@ -520,15 +562,34 @@ def _validate_unique_model_names(models: list[Model]) -> None:
         raise ValueError(f"Engine.collect_many requires unique model names, got duplicates: {duplicates}.")
 
 
-def _models_by_universe(models: list[Model]) -> dict[str, list[Model]]:
-    out: dict[str, list[Model]] = defaultdict(list)
+def _require_model_universe(model: Model, operation: str) -> str:
+    if model.universe is None:
+        raise ValueError(
+            f"{operation} requires Model.universe; "
+            "use Engine.evaluate_outputs() for universe-independent model outputs."
+        )
+    return model.universe
+
+
+def _require_models_universe(models: list[Model], operation: str) -> None:
+    missing = [model.name for model in models if model.universe is None]
+    if missing:
+        raise ValueError(
+            f"{operation} requires Model.universe for every model; "
+            f"missing for models: {missing}. "
+            "Use Engine.evaluate_outputs() for universe-independent model outputs."
+        )
+
+
+def _models_by_universe(models: list[Model]) -> dict[str | None, list[Model]]:
+    out: dict[str | None, list[Model]] = defaultdict(list)
     for model in models:
         out[model.universe].append(model)
     return dict(out)
 
 
 def _batch_cache_candidates(
-    models_by_universe: dict[str, list[Model]],
+    models_by_universe: dict[str | None, list[Model]],
     dates: tuple[str, ...],
     *,
     min_cache_ref_count: int,
@@ -547,10 +608,12 @@ def _batch_cache_candidates(
     return out
 
 
-def _validate_collect_info(info: FrameInfo, output_columns: tuple[str, ...]) -> None:
-    if not can_collect(info, output_columns):
+def _validate_collect_info(info: FrameInfo, model_name: str, output_name: str) -> str:
+    if not can_collect(info):
         raise ValueError(
-            "Engine.collect requires a daily output with date/secu_code keys and requested public output columns; "
+            "Engine.collect requires a daily output with date/secu_code keys and exactly one public value column; "
+            f"model={model_name!r}, output={output_name!r}, "
             f"got grain={info.grain!r}, keys={info.keys!r}, "
-            f"requested={list(output_columns)!r}, available={info.value_columns()!r}."
+            f"available={info.value_columns()!r}."
         )
+    return info.value_columns()[0]

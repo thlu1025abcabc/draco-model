@@ -13,7 +13,7 @@ raw = Source("trades_tbar")
 close = metric("close")(raw)
 output = Aggregate("1d", "last", value_col="close", alias="value")(close)
 
-model = Model(name="close_last", universe="ex2kamt", output=output)
+model = Model(name="close_last", universe="ex2kamt", output={"value": output})
 df = Engine(data_root="data").collect(model, dates=["20170103"])
 ```
 
@@ -28,7 +28,7 @@ engine = Engine(data_root="data")
 minute_close = engine.evaluate(model, close, "20170103").collect()
 ```
 
-Use `Engine.collect()` only for final factor output. The model output must be daily grain and must contain the requested public output columns; by default that list is `["value"]`. Pass `output_columns=[...]` to collect multiple final columns as long-form factors.
+Use `Engine.collect()` only for final factor output. Each model output must be daily grain with `(date, secu_code)` keys and exactly one public value column. `collect()` left joins each output to the model universe for each date, renames the output column to `value`, adds `factor_name`, and returns one long dataframe. Use dictionaries such as `{"amount": amount_node, "volume": volume_node}` when one model should emit multiple factors.
 
 ## Trace a Model
 

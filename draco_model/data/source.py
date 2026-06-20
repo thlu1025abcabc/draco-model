@@ -62,7 +62,7 @@ class SourceCatalog:
             raise FileNotFoundError(f"Missing source file: {path}")
         logger.debug("source.scan_date.start source=%s date=%s path=%s", source, date, path)
         frame = pl.scan_parquet(path)
-        frame = _standardize_columns(frame, date)
+        frame = _standardize_columns(frame, date, source)
         self._validate_fixed_schema(frame, source, date)
         self._validate_minutes(frame, source, date)
         self._scans[key] = frame
@@ -119,10 +119,10 @@ class SourceCatalog:
             raise ValueError(f"Source {source!r} date {date} has minute bars outside fixed grid: {values}.")
 
 
-def _standardize_columns(frame: pl.LazyFrame, date: str) -> pl.LazyFrame:
+def _standardize_columns(frame: pl.LazyFrame, date: str, source: str | None = None) -> pl.LazyFrame:
     columns = frame.collect_schema().names()
     renames = {}
-    for source, target in {
+    for vendor, target in {
         "SecuCode": "secu_code",
         "MinBar": "minute",
         "Price": "price",
@@ -133,9 +133,16 @@ def _standardize_columns(frame: pl.LazyFrame, date: str) -> pl.LazyFrame:
         "isfirst": "is_first",
         "islast": "is_last",
         "trading_day": "date",
+        "DealTime": "deal_time",
+        "BuyID": "buy_id",
+        "SellID": "sell_id",
+        "DealID": "deal_id",
+        "OrderTime": "order_time",
+        "OrderID": "order_id",
+        "OrderType": "order_type",
     }.items():
-        if source in columns and target not in columns:
-            renames[source] = target
+        if vendor in columns and target not in columns:
+            renames[vendor] = target
     if renames:
         frame = frame.rename(renames)
         columns = [renames.get(column, column) for column in columns]
@@ -160,8 +167,39 @@ def _standardize_columns(frame: pl.LazyFrame, date: str) -> pl.LazyFrame:
         casts.append(pl.col("is_last").cast(pl.Boolean))
     if casts:
         frame = frame.with_columns(casts)
+    if source in _LEVEL2_SOURCE_CASTS:
+        frame = frame.with_columns(
+            [
+                pl.col(column).cast(dtype)
+                for column, dtype in _LEVEL2_SOURCE_CASTS[source].items()
+                if column in columns
+            ]
+        )
+        if "secu_code" in columns:
+            frame = frame.with_columns(pl.col("secu_code").replace(_TRANSFER_CODES))
+            frame = frame.filter(pl.col("secu_code") <= _MAX_SECU_CODE)
     return frame
 
+
+_STEPTRADES_SCHEMA = (
+    "date",
+    "secu_code",
+    "deal_time",
+    "buy_id",
+    "sell_id",
+    "deal_id",
+    "price",
+    "volume",
+    "side",
+)
+
+_STEPORDERS_SCHEMA = (
+    "date",
+    "secu_code",
+    "order_time",
+    "order_id",
+    "order_type",
+)
 
 _TRADE_CANCEL_TBAR_SCHEMA = (
     "secu_code",
@@ -231,6 +269,8 @@ _UNIVERSE_EX2KAMT_SCHEMA = (
 )
 
 _FIXED_SOURCE_SCHEMAS = {
+    "steptrades": _STEPTRADES_SCHEMA,
+    "steporders": _STEPORDERS_SCHEMA,
     "trades_tbar": _TRADE_CANCEL_TBAR_SCHEMA,
     "cancels_tbar": _TRADE_CANCEL_TBAR_SCHEMA,
     "quotes_tbar": _QUOTE_TBAR_SCHEMA,
@@ -242,10 +282,32 @@ _FIXED_SOURCE_SCHEMAS = {
 _TICK_TBAR_IDENTITY_KEYS = (*KEY_COLUMNS, "price", "side")
 
 _FIXED_SOURCE_IDENTITY_KEYS = {
+    "steptrades": ("date", "secu_code", "deal_id"),
+    "steporders": ("date", "secu_code", "order_time", "order_id", "order_type"),
     "trades_tbar": _TICK_TBAR_IDENTITY_KEYS,
     "cancels_tbar": _TICK_TBAR_IDENTITY_KEYS,
     "quotes_tbar": _TICK_TBAR_IDENTITY_KEYS,
     "daily_k": DAILY_KEY_COLUMNS,
     "snapshot_tbar": KEY_COLUMNS,
     "universe/ex2kamt": DAILY_KEY_COLUMNS,
+}
+
+_TRANSFER_CODES = {22: 1872, 600849: 601607, 43: 1914, 601313: 601360}
+_MAX_SECU_CODE = 700000
+
+_LEVEL2_SOURCE_CASTS = {
+    "steptrades": {
+        "deal_time": pl.Int64,
+        "buy_id": pl.Int64,
+        "sell_id": pl.Int64,
+        "deal_id": pl.Int64,
+        "price": pl.Int64,
+        "volume": pl.Float64,
+        "side": pl.Int64,
+    },
+    "steporders": {
+        "order_time": pl.Int64,
+        "order_id": pl.Int64,
+        "order_type": pl.Int64,
+    },
 }

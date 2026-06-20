@@ -5,7 +5,7 @@ from typing import Callable
 
 from draco_model.core import Model, Node
 from draco_model.layers.aggregate import Aggregate
-from draco_model.layers.filters import Flag, Side, Where
+from draco_model.layers.filters import Flag, Side, Threshold, Where
 from draco_model.layers.names import validate_public_alias
 from draco_model.layers.operators import Col
 
@@ -29,9 +29,11 @@ _TRANSFORMS: dict[str, TransformBuilder] = {}
 
 __all__ = [
     "FactorRecipe",
+    "LastShortcut",
     "MetricShortcut",
     "Shortcut",
     "TransformShortcut",
+    "last",
     "metric",
     "transform",
 ]
@@ -99,6 +101,24 @@ class MetricShortcut(Shortcut):
 
 
 @dataclass(frozen=True)
+class LastShortcut(Shortcut):
+    """Filter rows at or after one minute."""
+
+    minute: int = 0
+
+    def __post_init__(self) -> None:
+        if self.name != "last":
+            raise ValueError("LastShortcut name must be 'last'.")
+        if self.alias is not None:
+            raise ValueError("last() does not support alias.")
+        if not isinstance(self.minute, int) or isinstance(self.minute, bool):
+            raise TypeError("last() minute must be an integer.")
+
+    def __call__(self, source: Node) -> Node:
+        return Where(Threshold("minute", op=">=", value=self.minute))(source)
+
+
+@dataclass(frozen=True)
 class TransformShortcut(Shortcut):
     """Named transform shortcut resolved through a build-time registry."""
 
@@ -124,6 +144,11 @@ class FactorRecipe:
 def metric(name: str, *, alias: str | None = None) -> MetricShortcut:
     """Return a build-time metric shortcut."""
     return MetricShortcut(name=name, alias=alias)
+
+
+def last(minute: int) -> LastShortcut:
+    """Return a shortcut that keeps rows whose minute is at or after minute."""
+    return LastShortcut(name="last", minute=minute)
 
 
 def transform(name: str, *, alias: str | None = None) -> TransformShortcut:

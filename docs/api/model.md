@@ -3,16 +3,22 @@
 ## `Model`
 
 ```python
-Model(name: str, universe: str, output: Node)
+Model(
+    name: str,
+    universe: str | None,
+    output: dict[str, Node],
+)
 ```
 
-Named factor graph rooted at a frame node.
+Named factor graph rooted at one or more frame outputs.
 
 | Parameter | Description |
 |---|---|
-| `name` | Factor/model name. Used as `factor_name` in `Engine.collect()`. |
-| `universe` | Universe source name, such as `"ex2kamt"`. |
-| `output` | Root frame node. Must have `kind == "frame"`. |
+| `name` | Factor/model name. Used as `factor_name` for a single `{"value": node}` output and as the prefix for other named outputs. |
+| `universe` | Universe source name, such as `"ex2kamt"`, or `None` for outputs that must not be universe-aligned. |
+| `output` | Dictionary mapping output names to root frame nodes. Every output node must have `kind == "frame"`. |
+
+`universe=None` is intended for dataset-like outputs such as market bars. Such models support `evaluate()`, `evaluate_outputs()`, and `trace()`. They cannot use `collect()`, `collect_many()`, or `Grid()`, because those operations require an explicit stock universe.
 
 ### Methods
 

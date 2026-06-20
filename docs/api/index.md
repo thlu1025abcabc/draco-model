@@ -12,6 +12,7 @@ This section documents public APIs exported from `draco_model`, `draco_model.lay
 ## Layers
 
 - [Source](layers/source.md)
+- [Level-2 Bars](layers/level2.md)
 - [Operators](layers/operators.md)
 - [Filters](layers/filters.md)
 - [Aggregate](layers/aggregate.md)
@@ -30,4 +31,4 @@ output_node = Layer(...)(input_node)
 
 `Source(...)`, `Op(...)`, and `Col(...)` are convenience APIs that create or expand graph nodes directly.
 
-`metric(...)` and `transform(...)` are build-time shortcuts, not runtime layers. They only become graph nodes after being applied to a `Node`.
+`metric(...)`, `last(...)`, and `transform(...)` are build-time shortcuts, not runtime layers. They only become graph nodes after being applied to a `Node`.

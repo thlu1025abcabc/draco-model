@@ -15,7 +15,6 @@ from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
 
 Executor = Callable[[Node, "EvalContext"], pl.LazyFrame]
 InfoBuilder = Callable[[Node, dict[str, "FrameInfo"], "EvalContext"], "FrameInfo"]
-FactorOutputColumns = list[str] | tuple[str, ...] | None
 
 _EXECUTORS: dict[str, Executor] = {}
 _INFO_BUILDERS: dict[str, InfoBuilder] = {}
@@ -189,28 +188,9 @@ def infer_grain_label(info: FrameInfo) -> str:
     return "unknown"
 
 
-def normalize_factor_output_columns(output_columns: FactorOutputColumns = None) -> tuple[str, ...]:
-    """Return normalized factor output columns for Engine.collect."""
-    if output_columns is None:
-        columns = ("value",)
-    else:
-        if isinstance(output_columns, str):
-            raise TypeError("Engine.collect output_columns must be a list or tuple of column names.")
-        columns = tuple(output_columns)
-    if not columns:
-        raise ValueError("Engine.collect output_columns must contain at least one column.")
-    invalid = [column for column in columns if not isinstance(column, str) or not column]
-    if invalid:
-        raise TypeError("Engine.collect output_columns must be non-empty strings.")
-    if len(set(columns)) != len(columns):
-        raise ValueError(f"Engine.collect output_columns must be unique, got {list(columns)}.")
-    return columns
-
-
-def can_collect(info: FrameInfo, output_columns: tuple[str, ...] = ("value",)) -> bool:
+def can_collect(info: FrameInfo) -> bool:
     """Return whether a frame can be formatted as a daily factor output."""
-    values = set(info.value_columns())
-    return info.identity_keys == DAILY_KEY_COLUMNS and all(column in values for column in output_columns)
+    return info.identity_keys == DAILY_KEY_COLUMNS and len(info.value_columns()) == 1
 
 
 def ordered_union(*groups: tuple[str, ...]) -> tuple[str, ...]:
@@ -355,32 +335,20 @@ def format_factor_output(
     frame: pl.LazyFrame,
     factor_name: str,
     eval_date: str,
-    output_columns: tuple[str, ...] = ("value",),
+    value_column: str,
+    universe: pl.LazyFrame,
 ) -> pl.LazyFrame:
     """Normalize a daily frame into the public factor output schema."""
     columns = frame.collect_schema().names()
-    missing = [column for column in output_columns if column not in columns]
-    if missing:
-        raise ValueError(f"Model output is missing output columns: {missing}.")
+    if value_column not in columns:
+        raise ValueError(f"Model output is missing output column: {value_column!r}.")
     selected = (
         frame.filter(pl.col("date") == eval_date)
-        .select([*DAILY_KEY_COLUMNS, *output_columns])
+        .select([*DAILY_KEY_COLUMNS, pl.col(value_column).alias("value")])
     )
-    if len(output_columns) == 1:
-        return (
-            selected.with_columns(
-                pl.lit(factor_name).alias("factor_name"),
-                pl.col(output_columns[0]).alias("value"),
-            )
-            .select(["date", "secu_code", "factor_name", "value"])
-        )
     return (
-        selected.unpivot(
-            index=list(DAILY_KEY_COLUMNS),
-            on=list(output_columns),
-            variable_name="__factor_column",
-            value_name="value",
-        )
-        .with_columns((pl.lit(f"{factor_name}__") + pl.col("__factor_column")).alias("factor_name"))
+        universe.join(selected, on=list(DAILY_KEY_COLUMNS), how="left")
+        .with_columns(pl.lit(factor_name).alias("factor_name"))
         .select(["date", "secu_code", "factor_name", "value"])
+        .sort(list(DAILY_KEY_COLUMNS))
     )

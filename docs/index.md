@@ -28,7 +28,7 @@ The documentation is split into a narrative user guide and a Sphinx-style API re
 
 ## Design Contracts
 
-- `Engine.collect()` accepts only daily output with `(date, secu_code)` keys and requested public output columns; it defaults to `["value"]` and can unpivot multiple `output_columns`.
+- `Engine.collect()` accepts only named daily outputs with `(date, secu_code)` keys and exactly one public value column per output; it left joins each output to the model universe and returns the standard long schema.
 - `Engine.collect_many()` keeps the same long output schema while reusing shared DAG nodes through a batch-scoped materialized cache.
 - Rolling `window` is a row/bar count at the input grain, not a calendar-day count.
 - `Source(..., lookback_days=...)` is explicit; rolling operators do not automatically expand source lookback.

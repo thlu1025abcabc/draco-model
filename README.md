@@ -11,7 +11,7 @@ raw = Source("trades_tbar")
 close = metric("close")(raw)
 output = Aggregate("1d", "last", value_col="close", alias="value")(close)
 
-model = Model(name="close_last", universe="ex2kamt", output=output)
+model = Model(name="close_last", universe="ex2kamt", output={"value": output})
 df = Engine(data_root="data").collect(model, dates=["20170103"])
 ```
 
@@ -19,6 +19,7 @@ df = Engine(data_root="data").collect(model, dates=["20170103"])
 
 - `Source("trades_tbar")` 扫描一个 raw source，不自动补 intraday grid。
 - `metric("name")(raw)` 是字段 recipe shorthand；它会展开成真实 DAG。
+- `last(minute)(raw)` 是时间过滤 shortcut，保留行内 `minute` 大于等于给定阈值的行。
 - `Col("price")` 是 raw column reference，只能应用到 frame 上，例如 `(Col("price") * Col("volume")).alias("amount")(raw)`。
 - `Op("name", ...)` 是统一 operator 入口，支持 `add/sub/mul/div/rolling_corr/rolling_beta/rolling_alpha`。
 - `Node` 和 `Col` 支持 magic arithmetic：`+ - * /` 都会生成 `op` 节点。
@@ -28,12 +29,13 @@ df = Engine(data_root="data").collect(model, dates=["20170103"])
 - `Join(how="full")` 用 SQL full join 横向对齐多个 frame；`Join(how="left", on=...)` 按显式 key 做 left join；显式 `on` 必须覆盖两个输入共享的 identity keys，避免漏掉 `price/side` 这类 key 后产生笛卡尔扇出。`how="full"` 不允许混合 daily identity frame 与 minute/raw frame；混合粒度请显式使用 `Join(how="left", on=("date", "secu_code"))`。两者输出 identity 都是所有输入 identity keys 的有序并集。
 - `Project()` 显式丢弃 internal payload，只保留 key columns + public fields。
 - `FillNull(value)` 支持固定数值、`"ffill"` 和 `"state"`；`"state"` 使用 field 的 `FieldInfo.source` 和 `grain_path` 构造同粒度 close_state，并对齐待填 frame 的 key 后填 public field。`FillNull()` 后会丢弃 old payload。
+- `Model(..., output={"name": node})` 显式声明 factor 输出；`output` 只支持 dictionary mapping。
 - `profile_plan(models)` 静态分析一组 model 的共享 structural nodes，并标记适合 batch materialization 的 cache candidate。
 - `Engine.collect_many(models, dates, ...)` 批量收集多个 model，并用 batch-scoped materialized cache 复用共享 DAG 节点；输出仍是标准长表。
 
 使用建议：`Source(...)` 不会自动补 grid，但如果 raw/minute source 后续要和 daily feature 或其他粒度横向组合，优先显式套一层 `Grid()`。这样下游节点都落在统一的 `(date, secu_code, minute)` grid 上，能减少 mixed-grain `Join()` 的歧义。
 
-`Engine.collect()` 只接受日频 factor 输出：输出必须是 `(date, secu_code)` grain，并包含 requested public output columns。默认输出列是 `["value"]`；也可以传 `output_columns=["value1", "value2"]`，在最后格式化时展开成长表。分钟级结果请先显式 `Aggregate("1d", ...)`，或直接用 `Engine.evaluate()` / `Engine.trace()` 查看。
+`Engine.collect()` 只接受日频 factor 输出：每个 output 必须是 `(date, secu_code)` grain，并且只有一个 public value column。`collect()` 会按 model universe 对每个 output 做 left join，把该 value column 统一改名为 `value`，增加 `factor_name`，最后 concat 成标准长表。多个因子请用 `Model(..., output={"a": node_a, "b": node_b})` 表达，不再用 `output_columns` 展开宽表。分钟级结果请先显式 `Aggregate("1d", ...)`，或直接用 `Engine.evaluate()` / `Engine.trace()` 查看。
 
 除非显式运行 `Project()`，其他 layer 默认保留 internal payload；`Aggregate(apply_to="field")` 和 `FillNull()` 是例外，它们会在计算后自动投影到 key columns + public fields。
 Payload 的当前特性：
@@ -112,6 +114,7 @@ python -m mkdocs build
 - `metric("open/close")`：分别用 `is_first` / `is_last` 过滤 price 后聚合。
 - `metric("high/low")`：对 price 做 max/min。
 - `metric("preclose")`：直接 evaluate 会报错；必须通过 `FillNull("state")(metric("preclose")(raw))` 使用。
+- `last(1400)(raw)`：等价于 `Where(Threshold("minute", op=">=", value=1400))(raw)`，对每个股票/日期保留指定 minute 及之后的行。
 
 示例：
 
@@ -192,6 +195,10 @@ daily_mean = Aggregate("1d", "mean", value_col="volume", alias="value")(volume_1
 
 ```text
 data/
+  steptrades/
+    20170103.parquet
+  steporders/
+    20170103.parquet
   trades_tbar/
     20170103.parquet
   quotes_tbar/
@@ -211,6 +218,8 @@ external/
 
 source 语义：
 
+- `steptrades` 是 vendor 逐笔成交源，保留成交时间、买卖委托 ID、成交 ID、原始整数价格、成交量和方向。
+- `steporders` 是 vendor 逐笔委托源，保留委托时间、委托 ID 和委托类型。
 - `trades_tbar` 是分钟级聚合后的逐笔成交数据。每行表示一个 stock、一个 minute、一个 price、一个 side，并聚合该 bucket 的 `Volume` 和 `No`。
 - `quotes_tbar` 是分钟级聚合后的逐笔委托数据，形状同样是 stock/minute/price/side。
 - `cancels_tbar` 是分钟级聚合后的逐笔撤单数据，形状同样是 stock/minute/price/side。
@@ -223,11 +232,32 @@ source scan 会标准化常见 vendor column name，例如 `SecuCode -> secu_cod
 
 `SourceCatalog.schema(source, dates)` 会优先使用固定 source schema，避免上层 schema inference 依赖 parquet scan。当前固定 schema：
 
+- `steptrades`：`date`、`secu_code`、`deal_time`、`buy_id`、`sell_id`、`deal_id`、`price`、`volume`、`side`。
+- `steporders`：`date`、`secu_code`、`order_time`、`order_id`、`order_type`。
 - `trades_tbar` / `cancels_tbar`：`secu_code`、`minute`、`price`、`side`、`volume`、`vw_wait_time`、`is_first`、`is_last`、`no`、`date`。
 - `quotes_tbar`：`secu_code`、`minute`、`price`、`side`、`volume`、`is_first`、`is_last`、`no`、`date`。
 - `daily_k`：`sec_code`、`date`、`open`、`high`、`low`、`close`、`shares`、`amount`、`limit_up`、`limit_down`、`preclose`、`isSuspend`、`isST`、`adjfactor`、`total_share`、`float_share`、`free_share`、`list_date`、`secu_code`。
 - `snapshot_tbar`：`AskPrice1`-`AskPrice10`、`BidPrice1`-`BidPrice10`、`AskVolume1`-`AskVolume10`、`BidVolume1`-`BidVolume10`、`aVOI1`-`aVOI5`、`secu_code`、`minute`、`date`。
 - `universe/ex2kamt`：`sec_code`、`preclose`、`close`、`adjfactor`、`secu_code`、`date`。
+
+Level-2 原始数据可以构造成标准 bar，并直接作为 named model output：
+
+```python
+from draco_model import Engine, Model
+from draco_model.layers import Source, TradesWithWaitBar
+
+trades = Source("steptrades")
+orders = Source("steporders")
+trades_wtminbar = TradesWithWaitBar()(trades, orders)
+model = Model("trades_wtminbar", None, {"trades_wtminbar": trades_wtminbar})
+
+outputs = Engine(data_root="data").evaluate_outputs(model, "20260618")
+bars = outputs["trades_wtminbar"]
+```
+
+`evaluate_outputs()` 保留 model output 名称和原始粒度，返回 `LazyFrame`，不做日频 factor 格式化，也不负责文件或云端传输。后续编排层可以独立决定怎样物化和传递结果。
+
+这里 `"trades_wtminbar"` 的第一个位置是 `Model.name`，字典里的 `"trades_wtminbar"` 是 output name；两者可以不同。`universe=None` 明确表示该 model 不做股票池对齐，因此不能用于 `collect()`、`collect_many()` 或 `Grid()`。
 
 ## Trace 和 Mermaid
 
@@ -243,6 +273,5 @@ python -m examples.preclose_fill_state_demo
 
 ## TODO
 
-- 后续 batch planner 需要合并多个 model / metric 中可复用的 source scan、operator branch 和 join。
-- 后续 optimizer 可以把同 source 的 `metric("amount")`、`metric("volume")`、`metric("vwap")` fuse 成更少的 physical plan。
-- 评估是否需要 smart join：根据输入 grain、key 覆盖、source 复用和 public/payload 列需求，减少不必要的宽表 join、重复 scan 或中间 payload 搬运。
+1. Fusion graph
+2. Smart join

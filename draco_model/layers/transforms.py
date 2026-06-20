@@ -65,6 +65,8 @@ class FillNull(Layer):
 
 @register_executor("_grid_source")
 def _grid_source(node: Node, context: EvalContext) -> pl.LazyFrame:
+    if context.model.universe is None:
+        raise ValueError("Grid requires Model.universe; universe-independent models cannot build a grid.")
     parent = node.inputs["input"]
     schema = context.infer_info(parent)
     frequency, auction = _grid_policy(node, schema)

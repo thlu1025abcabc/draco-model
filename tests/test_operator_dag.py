@@ -11,14 +11,14 @@ import pytest
 import draco_model
 import draco_model.layers as layer_api
 import draco_model.runtime.engine as engine_module
-from draco_model import Engine, Layer, Model
+from draco_model import Engine, Layer, Model as PublicModel
 from draco_model.core import Node, resolve_node_names
 from draco_model.layers import Aggregate, Col, FillNull, Grid, Join, Op, Project, Side, Source, Threshold, Where
 from draco_model.layers.aggregate import _auction_merge_targets
 from draco_model.layers.operators import _window_op
 from draco_model.market.schema import DAILY_KEY_COLUMNS, KEY_COLUMNS
 from draco_model.market.minute_calendar import MinuteCalendar
-from draco_model.recipes import FactorRecipe, Shortcut, metric, transform
+from draco_model.recipes import FactorRecipe, Shortcut, last, metric, transform
 from draco_model.runtime.execution import (
     EvalContext,
     FieldInfo,
@@ -49,6 +49,13 @@ BUILTIN_FRAME_OPS = (
     "source",
     "where",
 )
+
+
+def Model(name: str, universe: str, output: Node | dict[str, Node]) -> PublicModel:
+    """Test helper for single-output model setup under the dict-only public API."""
+    if isinstance(output, Node):
+        output = {"value": output}
+    return PublicModel(name, universe, output)
 
 
 def _test_join_frame(name: str) -> Node:
@@ -160,10 +167,37 @@ def test_metric_shortcut_is_not_a_runtime_layer() -> None:
     assert not isinstance(close, Layer)
     assert not isinstance(close, Node)
     assert not hasattr(layer_api, "Metric")
+    assert not hasattr(draco_model, "Output")
+    assert draco_model.last is last
     assert draco_model.metric is metric
     assert draco_model.transform is transform
     assert draco_model.Shortcut is Shortcut
     assert draco_model.FactorRecipe is FactorRecipe
+
+
+def test_model_requires_dictionary_output() -> None:
+    raw = Source("trades_tbar")
+
+    with pytest.raises(TypeError, match="dictionary"):
+        PublicModel("raw", "ex2kamt", raw)  # type: ignore[arg-type]
+    model = PublicModel("raw", "ex2kamt", {"value": raw})
+    assert model.output == {"value": raw}
+
+
+def test_model_allows_none_universe_but_rejects_invalid_values() -> None:
+    raw = Source("trades_tbar")
+
+    assert PublicModel("raw", None, {"value": raw}).universe is None
+    with pytest.raises(TypeError, match="non-empty string or None"):
+        PublicModel("raw", "", {"value": raw})
+
+
+def test_grid_requires_model_universe(sample_root: Path) -> None:
+    gridded = Grid()(Source("trades_tbar"))
+    model = PublicModel("gridless", None, {"value": gridded})
+
+    with pytest.raises(ValueError, match="Grid requires Model.universe"):
+        Engine(data_root=sample_root).evaluate_outputs(model, "20170103")["value"].collect()
 
 
 def test_transform_shortcut_placeholder_requires_registered_transform() -> None:
@@ -388,10 +422,28 @@ def test_threshold_filter_keeps_matching_rows(sample_root: Path) -> None:
         Model("large_volume_rows", "ex2kamt", filtered),
         filtered,
         "20170103",
-    ).collect()
+    ).collect().sort("minute")
 
     rows = frame.select(["minute", "volume"]).sort("minute").to_dict(as_series=False)
     assert rows == {"minute": [932, 933], "volume": [30.0, 20.0]}
+
+
+def test_last_shortcut_keeps_rows_at_or_after_minute(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    filtered = last(932)(raw)
+
+    frame = Engine(data_root=sample_root).evaluate(
+        Model("last_rows", "ex2kamt", filtered),
+        filtered,
+        "20170103",
+    ).collect()
+
+    assert frame["minute"].to_list() == [932, 933, 935, 1500]
+
+
+def test_last_shortcut_rejects_non_integer_minute() -> None:
+    with pytest.raises(TypeError, match="integer"):
+        last("932")  # type: ignore[arg-type]
 
 
 def test_where_stores_condition_in_params_not_subtree() -> None:
@@ -832,71 +884,66 @@ def test_collect_daily_output(sample_root: Path) -> None:
     result = Engine(data_root=sample_root).collect(Model("close_last", "ex2kamt", output), dates=["20170103"])
 
     assert result.to_dict(as_series=False) == {
-        "date": ["20170103"],
-        "secu_code": [1],
-        "factor_name": ["close_last"],
-        "value": [10.85],
+        "date": ["20170103", "20170103"],
+        "secu_code": [1, 2],
+        "factor_name": ["close_last", "close_last"],
+        "value": [10.85, None],
     }
 
 
-def test_collect_accepts_custom_single_output_column(sample_root: Path) -> None:
+def test_collect_uses_single_public_value_column(sample_root: Path) -> None:
     raw = Source("trades_tbar")
     output = Aggregate("1d", "sum", value_col="amount", alias="amount")(metric("amount")(raw))
     result = Engine(data_root=sample_root).collect(
         Model("daily_amount", "ex2kamt", output),
         dates=["20170103"],
-        output_columns=["amount"],
     )
 
     assert result.to_dict(as_series=False) == {
-        "date": ["20170103"],
-        "secu_code": [1],
-        "factor_name": ["daily_amount"],
-        "value": [880.0],
+        "date": ["20170103", "20170103"],
+        "secu_code": [1, 2],
+        "factor_name": ["daily_amount", "daily_amount"],
+        "value": [880.0, None],
     }
 
 
-def test_collect_unpivots_multiple_output_columns(sample_root: Path) -> None:
+def test_collect_concats_named_outputs(sample_root: Path) -> None:
+    raw = Source("trades_tbar")
+    amount = Aggregate("1d", "sum", value_col="amount", alias="amount")(metric("amount")(raw))
+    volume = Aggregate("1d", "sum", value_col="volume", alias="volume")(metric("volume")(raw))
+
+    result = Engine(data_root=sample_root).collect(
+        Model(
+            "trade_totals",
+            "ex2kamt",
+            {"amount": amount, "volume": volume},
+        ),
+        dates=["20170103"],
+    )
+
+    assert result.to_dict(as_series=False) == {
+        "date": ["20170103", "20170103", "20170103", "20170103"],
+        "secu_code": [1, 2, 1, 2],
+        "factor_name": [
+            "trade_totals__amount",
+            "trade_totals__amount",
+            "trade_totals__volume",
+            "trade_totals__volume",
+        ],
+        "value": [880.0, None, 85.0, None],
+    }
+
+
+def test_collect_rejects_multi_value_single_output(sample_root: Path) -> None:
     raw = Source("trades_tbar")
     amount = Aggregate("1d", "sum", value_col="amount", alias="amount")(metric("amount")(raw))
     volume = Aggregate("1d", "sum", value_col="volume", alias="volume")(metric("volume")(raw))
     output = Join()({"amount": amount, "volume": volume})
 
-    result = Engine(data_root=sample_root).collect(
-        Model("trade_totals", "ex2kamt", output),
-        dates=["20170103"],
-        output_columns=["amount", "volume"],
-    )
-
-    assert result.to_dict(as_series=False) == {
-        "date": ["20170103", "20170103"],
-        "secu_code": [1, 1],
-        "factor_name": ["trade_totals__amount", "trade_totals__volume"],
-        "value": [880.0, 85.0],
-    }
-
-
-def test_collect_rejects_unknown_output_column(sample_root: Path) -> None:
-    raw = Source("trades_tbar")
-    output = Aggregate("1d", "sum", value_col="amount", alias="amount")(metric("amount")(raw))
-
-    with pytest.raises(ValueError, match="requested"):
+    with pytest.raises(ValueError, match="exactly one public value column"):
         Engine(data_root=sample_root).collect(
-            Model("daily_amount", "ex2kamt", output),
+            Model("trade_totals", "ex2kamt", output),
             dates=["20170103"],
-            output_columns=["missing"],
-        )
-
-
-def test_collect_rejects_scalar_output_columns(sample_root: Path) -> None:
-    raw = Source("trades_tbar")
-    output = Aggregate("1d", "sum", value_col="amount", alias="amount")(metric("amount")(raw))
-
-    with pytest.raises(TypeError, match="list or tuple"):
-        Engine(data_root=sample_root).collect(
-            Model("daily_amount", "ex2kamt", output),
-            dates=["20170103"],
-            output_columns="amount",  # type: ignore[arg-type]
         )
 
 
@@ -1101,6 +1148,9 @@ def _write_two_day_collect_fixture(tmp_path: Path) -> None:
     data = tmp_path / "data"
     external.mkdir()
     pl.DataFrame({"date": ["20170103", "20170104"]}).write_parquet(external / "trading_days.parquet")
+    (data / "universe" / "ex2kamt").mkdir(parents=True)
+    for date in ["20170103", "20170104"]:
+        pl.DataFrame({"secu_code": [1]}).write_parquet(data / "universe" / "ex2kamt" / f"{date}.parquet")
     (data / "trades_tbar").mkdir(parents=True)
     for date, price in {"20170103": 10.0, "20170104": 20.0}.items():
         pl.DataFrame(

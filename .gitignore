@@ -26,6 +26,7 @@ site/
 
 # Local assistant/editor settings
 .claude/settings.local.json
+.codex/
 
 # OS
 .DS_Store

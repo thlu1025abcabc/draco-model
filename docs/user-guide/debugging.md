@@ -72,8 +72,8 @@ The returned string is a Mermaid flowchart. It uses resolved display names, node
 
 | Error | Meaning |
 |---|---|
-| `Engine.collect requires a daily output` | The model output is not daily grain. Use `Aggregate("1d", ..., alias="value")` or call `evaluate()`. |
-| `requires a public 'value' column` | The daily output does not expose a public `value` field. |
+| `Engine.collect requires a daily output` | A model output is not daily grain. Use `Aggregate("1d", ...)` or call `evaluate()`. |
+| `exactly one public value column` | A model output exposes zero or multiple public value fields. |
 | `must not start with '__'` | Public aliases cannot use the internal payload prefix. |
 | `missing fixed schema columns` | A known source parquet file does not satisfy its fixed source contract. |
 

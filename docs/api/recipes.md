@@ -2,6 +2,7 @@
 
 ```python
 metric(name: str, *, alias: str | None = None) -> MetricShortcut
+last(minute: int) -> LastShortcut
 transform(name: str, *, alias: str | None = None) -> TransformShortcut
 ```
 
@@ -9,10 +10,11 @@ Recipes are build-time helpers. They are not runtime `Layer` objects, do not cre
 
 ```python
 from draco_model.layers import Source
-from draco_model.recipes import metric
+from draco_model.recipes import last, metric
 
 raw = Source("trades_tbar")
 close = metric("close")(raw)
+late_raw = last(1400)(raw)
 ```
 
 ## Metric Shortcuts
@@ -47,6 +49,14 @@ close_panel = Grid()(metric("close")(raw))
 preclose = FillNull("state")(metric("preclose")(raw))
 ```
 
+## Filter Shortcuts
+
+| Shortcut | Expansion |
+|---|---|
+| `last(minute)` | `Where(Threshold("minute", op=">=", value=minute))` |
+
+`last(minute)` keeps rows whose `minute` is at or after the threshold for every stock and date.
+
 ## Transform Shortcuts
 
 `transform(name)` is a placeholder for future build-time transform shortcuts. No built-in transforms are registered yet, so applying an unknown transform raises a clear `ValueError`.
@@ -60,7 +70,7 @@ class LiqMoments(FactorRecipe):
         liq = metric(self.liq_name)(raw)
         moment = transform(self.op_name)(liq)
         ranked = transform("rank")(moment)
-        return Model(self.name, self.universe, ranked)
+        return Model(self.name, self.universe, {"value": ranked})
 ```
 
 `FactorRecipe` is a user-extensible factor-family base class. It is intentionally not a fixed pipeline container. Parameter spaces, mutation, batch generation, and cartesian products are left for later design.

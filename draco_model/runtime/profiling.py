@@ -14,6 +14,33 @@ from draco_model.core import Model, Node
 
 DEFAULT_EXCLUDE_CACHE_OPS = ("source",)
 
+# Explicit output schemas so empty (or all-null) profiles still carry typed columns.
+_PLAN_PROFILE_SCHEMA: dict[str, pl.DataType] = {
+    "node_id": pl.Utf8,
+    "kind": pl.Utf8,
+    "op": pl.Utf8,
+    "params": pl.Utf8,
+    "ref_count": pl.Int64,
+    "model_count": pl.Int64,
+    "models": pl.List(pl.Utf8),
+    "depth": pl.Int64,
+    "is_shared": pl.Boolean,
+    "cache_candidate": pl.Boolean,
+    "cache_reason": pl.Utf8,
+}
+
+_PROFILE_EVENT_SCHEMA: dict[str, pl.DataType] = {
+    "event": pl.Utf8,
+    "at_ms": pl.Float64,
+    "elapsed_ms": pl.Float64,
+    "model": pl.Utf8,
+    "universe": pl.Utf8,
+    "date": pl.Utf8,
+    "node_id": pl.Utf8,
+    "op": pl.Utf8,
+    "fields": pl.Utf8,
+}
+
 
 @dataclass(frozen=True)
 class PlanNodeProfile:
@@ -72,7 +99,8 @@ class PlanProfile:
                     "cache_reason": node.cache_reason,
                 }
                 for node in self.nodes
-            ]
+            ],
+            schema=_PLAN_PROFILE_SCHEMA,
         )
 
 
@@ -151,7 +179,8 @@ class Profiler:
                     "fields": _json_dumps(event.fields),
                 }
                 for event in self._events
-            ]
+            ],
+            schema=_PROFILE_EVENT_SCHEMA,
         )
 
 
@@ -173,16 +202,20 @@ def profile_plan(
     order: list[str] = []
 
     for model in model_list:
+        model_nodes = {node.id: node for node in model.nodes()}
         local_depths: dict[str, int] = {}
-        for node in model.nodes():
+        for node in model_nodes.values():
             if node.id not in nodes_by_id:
                 nodes_by_id[node.id] = node
                 order.append(node.id)
-            ref_counts[node.id] += 1
-            models_by_id[node.id].add(model.name)
-            depth = _node_depth(node, local_depths)
-            local_depths[node.id] = depth
-            depths[node.id] = max(depths.get(node.id, depth), depth)
+        for _, output_node in model.outputs:
+            for node_id in _node_ids_for_root(output_node):
+                node = model_nodes[node_id]
+                ref_counts[node.id] += 1
+                models_by_id[node.id].add(model.name)
+                depth = _node_depth(node, local_depths)
+                local_depths[node.id] = depth
+                depths[node.id] = max(depths.get(node.id, depth), depth)
 
     return PlanProfile(
         tuple(
@@ -243,6 +276,22 @@ def _node_depth(node: Node, local_depths: dict[str, int]) -> int:
     if not node.inputs:
         return 0
     return max(local_depths[parent.id] for parent in node.inputs.values()) + 1
+
+
+def _node_ids_for_root(root: Node) -> list[str]:
+    order: list[str] = []
+    seen: set[str] = set()
+
+    def visit(node: Node) -> None:
+        if node.id in seen:
+            return
+        seen.add(node.id)
+        for parent in node.inputs.values():
+            visit(parent)
+        order.append(node.id)
+
+    visit(root)
+    return order
 
 
 def _json_dumps(value: Any) -> str:
