@@ -42,6 +42,8 @@ def test_fixed_source_schema_does_not_scan_files(tmp_path: Path) -> None:
         "order_time",
         "order_id",
         "order_type",
+        "price",
+        "volume",
     )
     assert trade_schema == (
         "secu_code",
@@ -249,6 +251,8 @@ def _representative_source_frame(source: str) -> pl.DataFrame:
                 "OrderTime": [92950000],
                 "OrderID": [1],
                 "OrderType": [1],
+                "Price": [1000],
+                "Volume": [10],
             }
         )
     if source in {"trades_tbar", "cancels_tbar"}:

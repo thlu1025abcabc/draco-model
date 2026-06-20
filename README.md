@@ -233,7 +233,7 @@ source scan 会标准化常见 vendor column name，例如 `SecuCode -> secu_cod
 `SourceCatalog.schema(source, dates)` 会优先使用固定 source schema，避免上层 schema inference 依赖 parquet scan。当前固定 schema：
 
 - `steptrades`：`date`、`secu_code`、`deal_time`、`buy_id`、`sell_id`、`deal_id`、`price`、`volume`、`side`。
-- `steporders`：`date`、`secu_code`、`order_time`、`order_id`、`order_type`。
+- `steporders`：`date`、`secu_code`、`order_time`、`order_id`、`order_type`、`price`、`volume`。
 - `trades_tbar` / `cancels_tbar`：`secu_code`、`minute`、`price`、`side`、`volume`、`vw_wait_time`、`is_first`、`is_last`、`no`、`date`。
 - `quotes_tbar`：`secu_code`、`minute`、`price`、`side`、`volume`、`is_first`、`is_last`、`no`、`date`。
 - `daily_k`：`sec_code`、`date`、`open`、`high`、`low`、`close`、`shares`、`amount`、`limit_up`、`limit_down`、`preclose`、`isSuspend`、`isST`、`adjfactor`、`total_share`、`float_share`、`free_share`、`list_date`、`secu_code`。
@@ -259,6 +259,22 @@ bars = outputs["trades_wtminbar"]
 
 这里 `"trades_wtminbar"` 的第一个位置是 `Model.name`，字典里的 `"trades_wtminbar"` 是 output name；两者可以不同。`universe=None` 明确表示该 model 不做股票池对齐，因此不能用于 `collect()`、`collect_many()` 或 `Grid()`。
 
+`QuotesMinBar` 和 `CancelsMinBar` 用同样的方式从 `steptrades` + `steporders` 构造委托报价和撤单的 minute/price/side bar：
+
+```python
+from draco_model.layers import CancelsMinBar, QuotesMinBar, Source
+
+trades = Source("steptrades")
+orders = Source("steporders")
+quotes_minbar = QuotesMinBar()(trades, orders)
+cancels_minbar = CancelsMinBar()(trades, orders)
+```
+
+- `QuotesMinBar` 输出 `(date, secu_code, minute, price, side, volume, is_first, is_last, no)`，没有等待时间。
+- `CancelsMinBar` 输出与 `trades_wtminbar` 相同的列（含 `vw_wait_time`），等待时间是撤单时刻减去原始委托时刻、扣除午休。
+- 两者都按交易所拆分：沪市（`secu_code >= 600000`）走委托流（报价 `order_type` 0/10、撤单 -1/-11，外加收盘集合竞价从成交补价）；深市走委托流 `order_type` 2/12（自带价）和 1/11/3/13（市价/本方最优，价格从成交反查），撤单来自成交流 `side` -1/-11、价格回查对应报价。
+- `is_first`/`is_last` 标记本分钟最早/最晚事件落在哪个 price 档。同一委托被多笔同毫秒成交命中不同价位时会产生排序并列，构造层用 `(secu_code, order_time, order_id, price, side)` 做确定性 tie-break，因此输出可复现（同一输入每次结果一致）。
+
 ## Trace 和 Mermaid
 
 `Engine.trace(model, date)` 会按拓扑顺序 materialize 每个 frame node；`Model.explain_mermaid()` 会输出同一张 DAG。因为 metric 会展开，`amount`、`buyamount`、`vwap` 这类字段的内部 `where/op/aggregate` 都能在 trace 和图里看到。
@@ -269,6 +285,14 @@ bars = outputs["trades_wtminbar"]
 python -m examples.close_last
 python -m examples.top_volume_close_mean
 python -m examples.preclose_fill_state_demo
+```
+
+`sample/level2_bars.py` 按日期构造 level-2 bar 并对 golden 验收，支持用不同日期复跑：
+
+```powershell
+python sample/level2_bars.py 20260618              # trades + quotes + cancels，自动对比 golden
+python sample/level2_bars.py 20260618 --bar quotes
+python sample/level2_bars.py 20260101 --data-root D:/prod/level2 --out-dir sample/output
 ```
 
 ## TODO

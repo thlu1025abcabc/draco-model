@@ -199,6 +199,8 @@ _STEPORDERS_SCHEMA = (
     "order_time",
     "order_id",
     "order_type",
+    "price",
+    "volume",
 )
 
 _TRADE_CANCEL_TBAR_SCHEMA = (
@@ -309,5 +311,7 @@ _LEVEL2_SOURCE_CASTS = {
         "order_time": pl.Int64,
         "order_id": pl.Int64,
         "order_type": pl.Int64,
+        "price": pl.Int64,
+        "volume": pl.Float64,
     },
 }

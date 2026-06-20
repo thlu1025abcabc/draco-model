@@ -7,8 +7,16 @@ import pytest
 
 from draco_model import Engine, Model, metric
 from draco_model.data.trading_calendar import TradingCalendar
-from draco_model.layers import Source, TradesWithWaitBar
-from draco_model.layers.level2 import TRADES_WITH_WAIT_COLUMNS, aggregate_trades, match_trade_waits
+from draco_model.layers import CancelsMinBar, QuotesMinBar, Source, TradesWithWaitBar
+from draco_model.layers.level2 import (
+    QUOTES_MIN_BAR_COLUMNS,
+    TRADES_WITH_WAIT_COLUMNS,
+    _add_cancel_wait,
+    _add_sort_int,
+    aggregate_trades,
+    match_trade_waits,
+    split_orders_cancels,
+)
 
 
 DATE = "20170103"
@@ -85,7 +93,7 @@ def test_trades_with_wait_bar_is_a_named_model_output(tmp_path: Path) -> None:
     trades_dir.mkdir()
     orders_dir.mkdir()
     pl.DataFrame({"SecuCode": [1, 600000], "DealTime": [93025000, 93015000], "BuyID": [12, 1], "SellID": [99, 2], "DealID": [1, 1], "Price": [2010, 1005], "Volume": [50.0, 80.0], "Side": [0, 0]}).write_parquet(trades_dir / f"{DATE}.parquet")
-    pl.DataFrame({"SecuCode": [1, 600000], "OrderTime": [93020000, 93010000], "OrderID": [12, 1], "OrderType": [1, 0]}).write_parquet(orders_dir / f"{DATE}.parquet")
+    pl.DataFrame({"SecuCode": [1, 600000], "OrderTime": [93020000, 93010000], "OrderID": [12, 1], "OrderType": [1, 0], "Price": [2010, 1005], "Volume": [50.0, 80.0]}).write_parquet(orders_dir / f"{DATE}.parquet")
     bars = TradesWithWaitBar()(Source("steptrades"), Source("steporders"))
     close = metric("close")(bars)
     engine = _engine(tmp_path)
@@ -104,3 +112,116 @@ def test_trades_with_wait_bar_is_a_named_model_output(tmp_path: Path) -> None:
         engine.collect(model, [DATE])
     with pytest.raises(ValueError, match="requires Model.universe"):
         engine.collect_many([model], [DATE])
+
+
+def test_sh_order_stream_builds_quotes_and_cancels() -> None:
+    orders = pl.DataFrame(
+        {
+            "secu_code": [600000, 600000, 600000, 600000],
+            "date": [DATE] * 4,
+            "order_time": [93100000, 93100000, 93200000, 93200000],
+            "order_id": [11, 12, 13, 14],
+            "order_type": [0, 10, -1, -11],
+            "price": [1000, 1010, 990, 1020],
+            "volume": [10.0, 20.0, 5.0, 7.0],
+        }
+    ).lazy()
+    # a pre-open SH trade is never folded into the continuous quote stream
+    trades = pl.DataFrame(
+        {
+            "secu_code": [600000], "date": [DATE], "deal_time": [92500000],
+            "buy_id": [1], "sell_id": [2], "deal_id": [1], "price": [1000], "volume": [1.0], "side": [0],
+        }
+    ).lazy()
+
+    quotes, cancels = split_orders_cancels(trades, orders, DATE)
+    q = quotes.collect().sort("order_id")
+    c = cancels.collect().sort("order_id")
+
+    assert q["side"].to_list() == [0, 1]  # order_type 0 -> buy, 10 -> sell
+    assert q["price"].to_list() == pytest.approx([10.0, 10.1])  # vendor price scaled by 1/100
+    assert c["side"].to_list() == [0, 1]  # cancel order_type -1 -> 0, -11 -> 1
+    assert c["price"].to_list() == pytest.approx([9.9, 10.2])
+
+
+def test_sz_market_order_price_discovered_and_cancel_wait() -> None:
+    orders = pl.DataFrame(
+        {
+            "secu_code": [1, 1],
+            "date": [DATE, DATE],
+            "order_time": [93100000, 93105000],
+            "order_id": [21, 22],
+            "order_type": [2, 1],  # priced limit buy, market buy (price from trades)
+            "price": [1000, 0],
+            "volume": [10.0, 30.0],
+        }
+    ).lazy()
+    trades = pl.DataFrame(
+        {
+            "secu_code": [1, 1],
+            "date": [DATE, DATE],
+            "deal_time": [93110000, 93200000],
+            "buy_id": [22, 22],
+            "sell_id": [99, 0],
+            "deal_id": [1, 2],
+            "price": [1005, 0],
+            "volume": [30.0, 5.0],
+            "side": [0, -1],  # a real fill of order 22, then a buy-side cancel
+        }
+    ).lazy()
+
+    quotes, cancels = split_orders_cancels(trades, orders, DATE)
+    q = quotes.collect().sort("order_id")
+    assert q["order_id"].to_list() == [21, 22]
+    assert q["price"].to_list() == pytest.approx([10.0, 10.05])  # priced keeps its price, market takes the fill price
+
+    resolved = _add_cancel_wait(_add_sort_int(cancels), orders).collect()
+    assert resolved["side"].to_list() == [0]
+    assert resolved["price"].to_list() == pytest.approx([10.05])  # cancel price recovered from the quote
+    assert resolved["wait_time"].to_list() == [55.0]  # 09:32:00 - 09:31:05
+
+
+def test_quotes_and_cancels_min_bar_named_outputs(tmp_path: Path) -> None:
+    trades_dir = tmp_path / "steptrades"
+    orders_dir = tmp_path / "steporders"
+    trades_dir.mkdir()
+    orders_dir.mkdir()
+    pl.DataFrame(
+        {
+            "SecuCode": [1, 1],
+            "DealTime": [93110000, 93200000],
+            "BuyID": [22, 22],
+            "SellID": [99, 0],
+            "DealID": [1, 2],
+            "Price": [1005, 0],
+            "Volume": [30.0, 5.0],
+            "Side": [0, -1],
+        }
+    ).write_parquet(trades_dir / f"{DATE}.parquet")
+    pl.DataFrame(
+        {
+            "SecuCode": [1, 1],
+            "OrderTime": [93100000, 93105000],
+            "OrderID": [21, 22],
+            "OrderType": [2, 1],
+            "Price": [1000, 0],
+            "Volume": [10.0, 30.0],
+        }
+    ).write_parquet(orders_dir / f"{DATE}.parquet")
+
+    quotes = QuotesMinBar()(Source("steptrades"), Source("steporders"))
+    cancels = CancelsMinBar()(Source("steptrades"), Source("steporders"))
+    engine = _engine(tmp_path)
+    model = Model("bars", None, {"quotes_minbar": quotes, "cancels_minbar": cancels})
+    info_q = engine._infer_info(model, quotes, DATE)
+    info_c = engine._infer_info(model, cancels, DATE)
+    outputs = engine.evaluate_outputs(model, DATE)
+    quote_frame = outputs["quotes_minbar"].collect()
+    cancel_frame = outputs["cancels_minbar"].collect()
+
+    assert quote_frame.columns == list(QUOTES_MIN_BAR_COLUMNS)
+    assert cancel_frame.columns == list(TRADES_WITH_WAIT_COLUMNS)
+    assert info_q.identity_keys == ("date", "secu_code", "minute", "price", "side")
+    assert info_c.identity_keys == ("date", "secu_code", "minute", "price", "side")
+    assert 10.05 in quote_frame["price"].to_list()  # market order price discovered from trade
+    assert cancel_frame["vw_wait_time"].to_list() == [55.0]
