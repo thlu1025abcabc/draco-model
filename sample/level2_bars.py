@@ -29,7 +29,7 @@ from draco_model.layers import CancelsMinBar, QuotesMinBar, Source, TradesWithWa
 
 
 # steptrades/steporders + the golden bars currently live here.
-DEFAULT_DATA_ROOT = Path(r"D:\draco-bars\golden_sources")
+DEFAULT_DATA_ROOT = Path(r"D:\draco-model\data")
 
 # bar name -> (layer, golden subdirectory under the data root)
 BARS = {

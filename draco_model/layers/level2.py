@@ -285,10 +285,21 @@ def split_orders_cancels(
 
 
 def _add_sort_int(events: pl.LazyFrame) -> pl.LazyFrame:
-    """Assign a deterministic per-row sequence index for first/last detection."""
-    return events.sort("secu_code", "order_time", "order_id", "price", "side").with_columns(
-        sort_int=pl.lit(1, dtype=pl.Int64)
-    ).with_columns(pl.col("sort_int").cum_sum())
+    """Assign a deterministic per-row sequence index for first/last detection.
+
+    Ties (one order filled by several same-millisecond deals across price levels)
+    are broken by the side-aware fill order: an aggressive buy walks up the book,
+    so its earliest fill is the lowest price; a sell walks down, so its earliest
+    fill is the highest price. Cancels and single-price orders never tie here.
+    """
+    fill_price = pl.when(pl.col("side") == 0).then(pl.col("price")).otherwise(-pl.col("price"))
+    return (
+        events.with_columns(fill_price.alias("__fill_price"))
+        .sort("secu_code", "order_time", "order_id", "__fill_price", "side")
+        .with_columns(sort_int=pl.lit(1, dtype=pl.Int64))
+        .with_columns(pl.col("sort_int").cum_sum())
+        .drop("__fill_price")
+    )
 
 
 def _add_cancel_wait(cancels: pl.LazyFrame, orders: pl.LazyFrame) -> pl.LazyFrame:

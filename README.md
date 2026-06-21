@@ -273,7 +273,7 @@ cancels_minbar = CancelsMinBar()(trades, orders)
 - `QuotesMinBar` 输出 `(date, secu_code, minute, price, side, volume, is_first, is_last, no)`，没有等待时间。
 - `CancelsMinBar` 输出与 `trades_wtminbar` 相同的列（含 `vw_wait_time`），等待时间是撤单时刻减去原始委托时刻、扣除午休。
 - 两者都按交易所拆分：沪市（`secu_code >= 600000`）走委托流（报价 `order_type` 0/10、撤单 -1/-11，外加收盘集合竞价从成交补价）；深市走委托流 `order_type` 2/12（自带价）和 1/11/3/13（市价/本方最优，价格从成交反查），撤单来自成交流 `side` -1/-11、价格回查对应报价。
-- `is_first`/`is_last` 标记本分钟最早/最晚事件落在哪个 price 档。同一委托被多笔同毫秒成交命中不同价位时会产生排序并列，构造层用 `(secu_code, order_time, order_id, price, side)` 做确定性 tie-break，因此输出可复现（同一输入每次结果一致）。
+- `is_first`/`is_last` 标记本分钟最早/最晚事件落在哪个 price 档。同一委托被多笔同毫秒成交命中不同价位时会产生排序并列，构造层按吃单方向做确定性 tie-break：主动买单往上扫（最早成交在最低价），主动卖单往下扫（最早成交在最高价）。因此输出可复现，且 `is_first`/`is_last` 符合真实撮合的开/收方向。
 
 ## Trace 和 Mermaid
 
