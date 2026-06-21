@@ -255,6 +255,18 @@ def _representative_source_frame(source: str) -> pl.DataFrame:
                 "Volume": [10],
             }
         )
+    if source == "orderbook":
+        return pl.DataFrame(
+            {
+                "SecuCode": [1],
+                "TickTime": [93000000],
+                "Price": [1000],
+                **{f"AskPrice{level}": [1000] for level in range(1, 11)},
+                **{f"AskVolume{level}": [10] for level in range(1, 11)},
+                **{f"BidPrice{level}": [999] for level in range(1, 11)},
+                **{f"BidVolume{level}": [10] for level in range(1, 11)},
+            }
+        )
     if source in {"trades_tbar", "cancels_tbar"}:
         return pl.DataFrame(
             {

@@ -140,6 +140,7 @@ def _standardize_columns(frame: pl.LazyFrame, date: str, source: str | None = No
         "OrderTime": "order_time",
         "OrderID": "order_id",
         "OrderType": "order_type",
+        "TickTime": "tick_time",
     }.items():
         if vendor in columns and target not in columns:
             renames[vendor] = target
@@ -261,6 +262,17 @@ _SNAPSHOT_TBAR_SCHEMA = (
     "date",
 )
 
+_ORDERBOOK_SCHEMA = (
+    "secu_code",
+    "date",
+    "tick_time",
+    "price",
+    *(f"AskPrice{level}" for level in range(1, 11)),
+    *(f"AskVolume{level}" for level in range(1, 11)),
+    *(f"BidPrice{level}" for level in range(1, 11)),
+    *(f"BidVolume{level}" for level in range(1, 11)),
+)
+
 _UNIVERSE_EX2KAMT_SCHEMA = (
     "sec_code",
     "preclose",
@@ -273,6 +285,7 @@ _UNIVERSE_EX2KAMT_SCHEMA = (
 _FIXED_SOURCE_SCHEMAS = {
     "steptrades": _STEPTRADES_SCHEMA,
     "steporders": _STEPORDERS_SCHEMA,
+    "orderbook": _ORDERBOOK_SCHEMA,
     "trades_tbar": _TRADE_CANCEL_TBAR_SCHEMA,
     "cancels_tbar": _TRADE_CANCEL_TBAR_SCHEMA,
     "quotes_tbar": _QUOTE_TBAR_SCHEMA,
@@ -286,6 +299,7 @@ _TICK_TBAR_IDENTITY_KEYS = (*KEY_COLUMNS, "price", "side")
 _FIXED_SOURCE_IDENTITY_KEYS = {
     "steptrades": ("date", "secu_code", "deal_id"),
     "steporders": ("date", "secu_code", "order_time", "order_id", "order_type"),
+    "orderbook": ("date", "secu_code", "tick_time"),
     "trades_tbar": _TICK_TBAR_IDENTITY_KEYS,
     "cancels_tbar": _TICK_TBAR_IDENTITY_KEYS,
     "quotes_tbar": _TICK_TBAR_IDENTITY_KEYS,
@@ -313,5 +327,9 @@ _LEVEL2_SOURCE_CASTS = {
         "order_type": pl.Int64,
         "price": pl.Int64,
         "volume": pl.Float64,
+    },
+    "orderbook": {
+        "tick_time": pl.Int64,
+        "price": pl.Int64,
     },
 }
